@@ -80,8 +80,28 @@ def log_event(payload: dict[str, Any]) -> None:
 
 def assert_no_duplicate_process() -> None:
     current_pid = os.getpid()
-    parent_pid = os.getppid()
-    result = subprocess.run(["ps", "-axo", "pid=,command="], text=True, capture_output=True, check=True)
+    result = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], text=True, capture_output=True, check=True)
+    process_rows: list[tuple[int, int, str]] = []
+    parent_by_pid: dict[int, int] = {}
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(maxsplit=2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        command = parts[2] if len(parts) > 2 else ""
+        process_rows.append((pid, ppid, command))
+        parent_by_pid[pid] = ppid
+
+    ancestor_pids = {current_pid}
+    next_pid = parent_by_pid.get(current_pid, os.getppid())
+    while next_pid and next_pid not in ancestor_pids:
+        ancestor_pids.add(next_pid)
+        next_pid = parent_by_pid.get(next_pid)
+
     suspicious: list[str] = []
     needles = (
         "bin/hummingbot_quickstart.py",
@@ -90,16 +110,8 @@ def assert_no_duplicate_process() -> None:
         "run_zec_tiny_supervised_pilot.py",
         "run_gemini_zec_v2_tiny_live_smoke.py",
     )
-    for line in result.stdout.splitlines():
-        parts = line.strip().split(maxsplit=1)
-        if not parts:
-            continue
-        try:
-            pid = int(parts[0])
-        except ValueError:
-            continue
-        command = parts[1] if len(parts) > 1 else ""
-        if pid in {current_pid, parent_pid}:
+    for pid, _ppid, command in process_rows:
+        if pid in ancestor_pids:
             continue
         if "pytest" in command or "egrep" in command:
             continue

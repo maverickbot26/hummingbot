@@ -41,6 +41,7 @@ async def run(args):
         order_amount_base=Decimal(args.order_amount_base),
         max_order_size_base=Decimal(args.max_order_size_base),
         target_base_amount=decimal_or_none(args.target_base_amount),
+        starting_base_amount=decimal_or_none(args.starting_base_amount),
         max_inventory_deviation_base=Decimal(args.max_inventory_deviation_base),
         external_mid_reference=decimal_or_none(args.external_mid),
         max_external_mid_deviation_pct=Decimal(args.max_external_mid_deviation_pct),
@@ -87,6 +88,7 @@ def main():
     parser.add_argument("--order-amount-base", default="0.002")
     parser.add_argument("--max-order-size-base", default="0.002")
     parser.add_argument("--target-base-amount")
+    parser.add_argument("--starting-base-amount")
     parser.add_argument("--base-position")
     parser.add_argument("--max-inventory-deviation-base", default="0.010")
     parser.add_argument("--max-external-mid-deviation-pct", default="0.01")
