@@ -12,6 +12,7 @@ Secrets are loaded from macOS Keychain and never printed.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import fcntl
 import json
 import os
@@ -26,6 +27,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import yaml
+
+from controllers.market_making.gemini_zec_pmm_tiny import GeminiZECTinyPMMConfig, GeminiZECTinyPMMController
 from scripts.maverick.run_zec_tiny_supervised_pilot import (
     GeminiPrivate,
     balances,
@@ -114,6 +118,126 @@ def assert_order_bounds(orders: list[dict[str, Any]]) -> None:
         raise RuntimeError(f"total_remaining_exceeds_tiny_bound: {total_remaining}")
     if max_remaining > MAX_SINGLE_ORDER_ZEC:
         raise RuntimeError(f"single_order_exceeds_tiny_bound: {max_remaining}")
+
+
+class StaticMarketDataProvider:
+    def __init__(self, mid_price: Decimal):
+        self.mid_price = mid_price
+        self.initialized_rate_sources = []
+
+    def initialize_rate_sources(self, connector_pairs):
+        self.initialized_rate_sources.extend(connector_pairs)
+
+    def get_price_by_type(self, connector_name, trading_pair, price_type):
+        return self.mid_price
+
+    def time(self):
+        return time.time()
+
+
+def load_yaml(path: Path) -> dict[str, Any]:
+    with path.open() as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Invalid YAML mapping: {path}")
+    return data
+
+
+def dump_yaml(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+
+
+def controller_config_paths(v2_config: str) -> list[tuple[str, Path]]:
+    script_path = REPO_ROOT / "conf" / "scripts" / v2_config
+    script_config = load_yaml(script_path)
+    paths: list[tuple[str, Path]] = []
+    for rel_path in script_config.get("controllers_config", []):
+        paths.append((rel_path, REPO_ROOT / "conf" / "controllers" / rel_path))
+    if not paths:
+        raise RuntimeError(f"No controllers_config entries in {script_path}")
+    return paths
+
+
+async def controller_quote_plan_from_config(
+    controller_path: Path,
+    mid_price: Decimal,
+    starting_base_amount: Decimal | None,
+) -> dict[str, Any]:
+    config_data = load_yaml(controller_path)
+    if starting_base_amount is not None:
+        config_data["starting_base_amount"] = str(starting_base_amount)
+    config = GeminiZECTinyPMMConfig(**config_data)
+    controller = GeminiZECTinyPMMController(
+        config=config,
+        market_data_provider=StaticMarketDataProvider(mid_price),
+        actions_queue=asyncio.Queue(),
+    )
+    await controller.update_processed_data()
+    actions = controller.determine_executor_actions()
+    quote_snapshot = controller.quote_snapshot_from_actions(actions)
+    metrics = controller.get_custom_info()
+    sides = sorted({item["side"] for item in quote_snapshot.values()})
+    return {
+        "controller_config": str(controller_path.relative_to(REPO_ROOT)),
+        "controller_id": config.id,
+        "starting_base_amount": str(starting_base_amount) if starting_base_amount is not None else None,
+        "quote_snapshot": quote_snapshot,
+        "action_count": len(actions),
+        "sides": sides,
+        "metrics": metrics,
+        "two_sided": sides == ["BUY", "SELL"],
+    }
+
+
+def validate_controller_quote_plan(plan: dict[str, Any]) -> None:
+    metrics = plan["metrics"]
+    if metrics.get("paused"):
+        raise RuntimeError(f"Controller preflight paused: {metrics.get('pause_reasons')}")
+    suppressed_sides = metrics.get("inventory_suppressed_sides") or []
+    suppression_reason = (metrics.get("inventory_status") or {}).get("suppression_reason")
+    if not suppressed_sides and not plan["two_sided"]:
+        raise RuntimeError(f"Controller preflight expected two-sided quotes but got {plan['sides']}: {plan['quote_snapshot']}")
+    if suppressed_sides and not suppression_reason:
+        raise RuntimeError(f"Controller preflight had inventory suppression without explicit reason: {metrics}")
+    if suppressed_sides and plan["action_count"] != 1:
+        raise RuntimeError(f"Controller preflight expected one-sided inventory-suppressed quote but got {plan['quote_snapshot']}")
+
+
+async def build_and_validate_preflight_plan(v2_config: str, mid_price: Decimal, starting_base_amount: Decimal) -> dict[str, Any]:
+    plans: list[dict[str, Any]] = []
+    legacy_plans: list[dict[str, Any]] = []
+    for _, controller_path in controller_config_paths(v2_config):
+        plan = await controller_quote_plan_from_config(controller_path, mid_price, starting_base_amount)
+        validate_controller_quote_plan(plan)
+        plans.append(plan)
+        legacy_plans.append(await controller_quote_plan_from_config(controller_path, mid_price, None))
+    return {
+        "v2_config": v2_config,
+        "mid_price": str(mid_price),
+        "starting_base_amount": str(starting_base_amount),
+        "controllers": plans,
+        "legacy_without_starting_base_amount": legacy_plans,
+    }
+
+
+def build_runtime_v2_config(v2_config: str, run_id: str, starting_base_amount: Decimal) -> str:
+    script_path = REPO_ROOT / "conf" / "scripts" / v2_config
+    script_config = load_yaml(script_path)
+    runtime_controllers: list[str] = []
+    for rel_path in script_config.get("controllers_config", []):
+        source_controller_path = REPO_ROOT / "conf" / "controllers" / rel_path
+        controller_config = load_yaml(source_controller_path)
+        controller_config["starting_base_amount"] = str(starting_base_amount)
+        source_rel = Path(rel_path)
+        runtime_rel = str(source_rel.with_name(f"{source_rel.stem}_runtime_{run_id}{source_rel.suffix}"))
+        dump_yaml(REPO_ROOT / "conf" / "controllers" / runtime_rel, controller_config)
+        runtime_controllers.append(runtime_rel)
+    script_config["controllers_config"] = runtime_controllers
+    source_name = Path(v2_config)
+    runtime_script_name = f"{source_name.stem}_runtime_{run_id}{source_name.suffix}"
+    dump_yaml(REPO_ROOT / "conf" / "scripts" / runtime_script_name, script_config)
+    return runtime_script_name
 
 
 def start_deadman(run_id: str) -> tuple[subprocess.Popen[Any], Path]:
@@ -211,6 +335,8 @@ def main() -> int:
         if basis_start_bp > BASIS_THRESHOLD_BP:
             raise RuntimeError(f"Refusing to start: Gemini/Coinbase basis too wide {basis_start_bp:.1f}bp")
 
+        preflight_plan = asyncio.run(build_and_validate_preflight_plan(args.v2_config, start_mid, start_balances["ZEC"]))
+
         if args.dry_run_preflight:
             log_event({
                 "event": "dry_run_preflight_ok",
@@ -221,9 +347,11 @@ def main() -> int:
                 "open_orders": len(pre_orders),
                 "max_single_order_zec": MAX_SINGLE_ORDER_ZEC,
                 "max_total_remaining_zec": MAX_TOTAL_REMAINING_ZEC,
+                "controller_preflight": preflight_plan,
             })
             return 0
 
+        runtime_v2_config = build_runtime_v2_config(args.v2_config, run_id, start_balances["ZEC"])
         started_ms = int(time.time() * 1000)
         start_snapshot = portfolio_snapshot(gemini)
         history: deque[MidSnapshot] = deque()
@@ -238,13 +366,15 @@ def main() -> int:
         HEARTBEAT_FILE.write_text(str(time.time()))
         watchdog_proc, watchdog_log_path = start_deadman(run_id)
         hb_log = hb_log_path.open("w")
-        cmd = [sys.executable, "scripts/maverick/headless_no_mqtt_quickstart.py", "--v2", args.v2_config]
+        cmd = [sys.executable, "scripts/maverick/headless_no_mqtt_quickstart.py", "--v2", runtime_v2_config]
         proc = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=hb_log, stderr=subprocess.STDOUT)
         log_event({
             "event": "v2_live_smoke_started",
             "pid": proc.pid,
             "watchdog_pid": watchdog_proc.pid if watchdog_proc else None,
             "v2_config": args.v2_config,
+            "runtime_v2_config": runtime_v2_config,
+            "controller_preflight": preflight_plan,
             "runtime_seconds": args.runtime_seconds,
             "hb_log": str(hb_log_path),
             "watchdog_log": str(watchdog_log_path) if watchdog_log_path else None,
@@ -336,6 +466,8 @@ def main() -> int:
             "run_id": run_id,
             "mode": "gemini_zec_v2_tiny_live_smoke",
             "v2_config": args.v2_config,
+            "runtime_v2_config": runtime_v2_config,
+            "controller_preflight": preflight_plan,
             "started_ms": started_ms,
             "runtime_seconds_requested": args.runtime_seconds,
             "stop_reason": stop_reason,

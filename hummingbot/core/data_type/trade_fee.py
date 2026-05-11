@@ -211,12 +211,16 @@ class TradeFeeBase(ABC):
             if self._are_tokens_interchangeable(quote, token):
                 fee_amount += amount_from_percentage
             else:
-                conversion_rate: Decimal = self._get_exchange_rate(trading_pair, exchange, rate_source)
-                # Protect against division by zero - use trade price as fallback if rate is 0
-                if conversion_rate == S_DECIMAL_0:
-                    conversion_rate = price if price > S_DECIMAL_0 else Decimal("1")
+                try:
+                    conversion_rate: Decimal = self._get_exchange_rate(trading_pair, exchange, rate_source)
+                except ValueError:
+                    return S_DECIMAL_0
+                if conversion_rate is None or conversion_rate == S_DECIMAL_0:
+                    return S_DECIMAL_0
                 fee_amount += amount_from_percentage / conversion_rate
         for flat_fee in self.flat_fees:
+            if flat_fee.amount == S_DECIMAL_0:
+                continue
             if self._are_tokens_interchangeable(flat_fee.token, token):
                 # No need to convert the value
                 fee_amount += flat_fee.amount
@@ -226,7 +230,12 @@ class TradeFeeBase(ABC):
                 fee_amount += flat_fee.amount * price
             else:
                 conversion_pair: str = combine_to_hb_trading_pair(base=flat_fee.token, quote=token)
-                conversion_rate: Decimal = self._get_exchange_rate(conversion_pair, exchange, rate_source)
+                try:
+                    conversion_rate: Decimal = self._get_exchange_rate(conversion_pair, exchange, rate_source)
+                except ValueError:
+                    return S_DECIMAL_0
+                if conversion_rate is None or conversion_rate == S_DECIMAL_0:
+                    return S_DECIMAL_0
                 fee_amount += flat_fee.amount * conversion_rate
         return fee_amount
 

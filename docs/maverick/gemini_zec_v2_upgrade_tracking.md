@@ -28,7 +28,11 @@ Local tracking doc used because the upstream `origin` repository is read-only an
 - [x] Added local safe V2 config files: `conf/scripts/gemini_zec_v2_tiny_live.yml` and `conf/controllers/market_making/gemini_zec_pmm_tiny_live.yml`.
 - [x] Re-ran tests and dry-run before live: 44 passed / 13 warnings; dry-run matched maker-only tiny shape.
 - [x] Ran 12-minute supervised V2 live smoke on 2026-05-11 with deadman armed; final Gemini ZEC-USD open orders = 0.
-- [ ] Before Phase 4, investigate why live V2 submitted only the buy side and logged recurring `last traded price` lookup warnings plus zero-fee `DivisionByZero` fee-display warnings.
+- [x] Investigated Phase 3 blocker: live V2 controller inventory guard used V2 executor positions only, so a fresh live run saw effective ZEC as `0` against target `0.568` / lower bound `0.558` and intentionally suppressed SELL.
+- [x] Fixed Phase 4 gate: controller now supports `starting_base_amount`; live supervisor injects current Gemini ZEC balance into runtime V2 config, emits controller quote preflight telemetry, and refuses one-sided quotes unless inventory suppression has an explicit reason.
+- [x] Fixed recurring `last traded price` warning by using the generic Gemini ticker rate-limit id (`/v2/ticker/{}`) for pair-specific ticker requests instead of `/v2/ticker/zecusd`, which had no throttler entry.
+- [x] Fixed zero-fee fee-display noise by skipping zero flat fees and returning `Decimal("0")` when conversion rates are zero/missing instead of allowing division/conversion errors to bubble into `InFlightOrder.cumulative_fee_paid`.
+- [x] Validation after fixes: targeted controller/Gemini/fee tests `46 passed`; full Gemini connector tests `37 passed`; paper sim two-sided; live supervisor `--dry-run-preflight` read-only check showed two-sided runtime plan and legacy no-starting-balance plan reproducing BUY-only / SELL suppression.
 
 ## Live Gate Reminder
 Before any next live phase:
@@ -37,4 +41,4 @@ Before any next live phase:
 3. Re-run connector + controller tests.
 4. Run V2 dry-run and inspect metrics.
 5. Use maker-only size caps; do not leave live orders open.
-6. For Phase 4 specifically, prove two-sided V2 live order submission and clean up the live warning noise first.
+6. For Phase 4 specifically, run the tiny dry-run gate first; live can proceed only after Eric explicitly authorizes a new bounded smoke.

@@ -7,6 +7,7 @@ from hummingbot.core.data_type.common import PriceType, TradeType
 from hummingbot.strategy_v2.executors.data_types import PositionSummary
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
+from scripts.maverick.run_gemini_zec_v2_tiny_live_smoke import validate_controller_quote_plan
 
 
 class StaticMarketDataProvider:
@@ -107,6 +108,49 @@ class GeminiZECTinyPMMControllerTests(TestCase):
         self.assertEqual(["buy_0"], [action.executor_config.level_id for action in actions])
         self.assertEqual(["SELL"], controller.get_custom_info()["inventory_suppressed_sides"])
 
+    def test_starting_base_amount_in_inventory_guard_allows_two_sided_live_restart(self):
+        controller = self.make_controller(
+            target_base_amount=Decimal("0.568"),
+            starting_base_amount=Decimal("0.568"),
+            max_inventory_deviation_base=Decimal("0.010"),
+        )
+        self.async_run(controller.update_processed_data())
+
+        actions = controller.determine_executor_actions()
+
+        self.assertEqual({"buy_0", "sell_0"}, {action.executor_config.level_id for action in actions})
+        metrics = controller.get_custom_info()
+        self.assertEqual([], metrics["inventory_suppressed_sides"])
+        self.assertEqual("0.568", metrics["inventory_status"]["current_base_amount"])
+        self.assertEqual("starting_base_amount_plus_v2_positions", metrics["inventory_status"]["position_source"])
+
+    def test_inventory_guard_reports_explicit_suppression_reason(self):
+        controller = self.make_controller(target_base_amount=Decimal("0.500"), max_inventory_deviation_base=Decimal("0.010"))
+        controller.positions_held = [self.make_position(Decimal("0.480"))]
+        self.async_run(controller.update_processed_data())
+
+        controller.determine_executor_actions()
+
+        inventory_status = controller.get_custom_info()["inventory_status"]
+        self.assertEqual("current_base_below_lower_bound", inventory_status["suppression_reason"])
+        self.assertEqual("0.480", inventory_status["current_base_amount"])
+
+    def test_inventory_guard_includes_starting_base_amount(self):
+        controller = self.make_controller(
+            target_base_amount=Decimal("0.500"),
+            starting_base_amount=Decimal("0.500"),
+            max_inventory_deviation_base=Decimal("0.010"),
+        )
+        self.async_run(controller.update_processed_data())
+
+        actions = controller.determine_executor_actions()
+        metrics = controller.get_custom_info()
+
+        self.assertEqual({"buy_0", "sell_0"}, {action.executor_config.level_id for action in actions})
+        self.assertEqual([], metrics["inventory_suppressed_sides"])
+        self.assertEqual("0.500", metrics["inventory_status"]["current_base_amount"])
+        self.assertEqual("starting_base_amount_plus_v2_positions", metrics["inventory_status"]["position_source"])
+
     def test_external_mid_sanity_pause_blocks_quotes(self):
         controller = self.make_controller(external_mid_reference=Decimal("600"), max_external_mid_deviation_pct=Decimal("0.01"))
         self.async_run(controller.update_processed_data())
@@ -145,3 +189,33 @@ class GeminiZECTinyPMMControllerTests(TestCase):
 
         self.assertEqual([], controller.determine_executor_actions())
         self.assertIn("volatility_pause", controller.get_custom_info()["pause_reasons"])
+
+
+class GeminiZECV2LiveSmokePreflightTests(TestCase):
+
+    def test_preflight_rejects_one_sided_without_explicit_inventory_suppression(self):
+        plan = {
+            "metrics": {"paused": False, "inventory_suppressed_sides": [], "inventory_status": {}},
+            "two_sided": False,
+            "sides": ["BUY"],
+            "quote_snapshot": {"buy_0": {"side": "BUY"}},
+            "action_count": 1,
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "expected two-sided"):
+            validate_controller_quote_plan(plan)
+
+    def test_preflight_allows_one_sided_with_explicit_inventory_suppression(self):
+        plan = {
+            "metrics": {
+                "paused": False,
+                "inventory_suppressed_sides": ["SELL"],
+                "inventory_status": {"suppression_reason": "current_base_below_lower_bound"},
+            },
+            "two_sided": False,
+            "sides": ["BUY"],
+            "quote_snapshot": {"buy_0": {"side": "BUY"}},
+            "action_count": 1,
+        }
+
+        validate_controller_quote_plan(plan)

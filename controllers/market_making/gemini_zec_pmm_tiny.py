@@ -37,6 +37,7 @@ class GeminiZECTinyPMMConfig(MarketMakingControllerConfigBase):
     skip_rebalance: bool = True
     zero_fee_accounting: bool = True
     target_base_amount: Optional[Decimal] = None
+    starting_base_amount: Optional[Decimal] = None
     max_inventory_deviation_base: Decimal = Field(default=Decimal("0.010"), ge=Decimal("0"))
     external_mid_reference: Optional[Decimal] = None
     max_external_mid_deviation_pct: Decimal = Field(default=Decimal("0.01"), gt=Decimal("0"))
@@ -54,6 +55,7 @@ class GeminiZECTinyPMMController(MarketMakingControllerBase):
         self._last_reference_price: Optional[Decimal] = None
         self._last_pause_reasons: List[str] = []
         self._last_inventory_suppressed_sides: List[str] = []
+        self._last_inventory_status: Dict[str, Optional[str]] = {}
         self._last_quote_prices: Dict[str, str] = {}
         self._last_quote_amounts: Dict[str, str] = {}
         self._one_shot_started_level_ids: Set[str] = set()
@@ -164,8 +166,10 @@ class GeminiZECTinyPMMController(MarketMakingControllerBase):
             "max_order_size_base": str(self.config.max_order_size_base),
             "effective_order_size_base": str(min(self.config.order_amount_base, self.config.max_order_size_base)),
             "target_base_amount": str(self.config.target_base_amount) if self.config.target_base_amount is not None else None,
+            "starting_base_amount": str(self.config.starting_base_amount) if self.config.starting_base_amount is not None else None,
             "max_inventory_deviation_base": str(self.config.max_inventory_deviation_base),
             "inventory_suppressed_sides": list(self._last_inventory_suppressed_sides),
+            "inventory_status": dict(self._last_inventory_status),
             "one_shot_mode": self.config.one_shot_mode,
             "one_shot_started_level_ids": sorted(self._one_shot_started_level_ids),
             "last_quote_prices": dict(self._last_quote_prices),
@@ -173,13 +177,35 @@ class GeminiZECTinyPMMController(MarketMakingControllerBase):
         }
 
     def _inventory_suppressed_sides(self) -> List[str]:
+        self._last_inventory_status = {}
         if self.config.target_base_amount is None:
             return []
-        current_base = self.get_current_base_position()
+        current_base = self.get_effective_base_position()
         lower_bound = self.config.target_base_amount - self.config.max_inventory_deviation_base
         upper_bound = self.config.target_base_amount + self.config.max_inventory_deviation_base
+        self._last_inventory_status = {
+            "current_base_amount": str(current_base),
+            "target_base_amount": str(self.config.target_base_amount),
+            "lower_bound": str(lower_bound),
+            "upper_bound": str(upper_bound),
+            "position_source": "starting_base_amount_plus_v2_positions" if self.config.starting_base_amount is not None else "v2_positions_only",
+            "suppression_reason": None,
+        }
         if current_base <= lower_bound:
+            self._last_inventory_status["suppression_reason"] = "current_base_below_lower_bound"
             return [TradeType.SELL.name]
         if current_base >= upper_bound:
+            self._last_inventory_status["suppression_reason"] = "current_base_above_upper_bound"
             return [TradeType.BUY.name]
         return []
+
+    def get_effective_base_position(self) -> Decimal:
+        """Return the base inventory used by the guard.
+
+        V2 controller positions only include positions created by V2 executors in
+        the current run. For spot inventory guards we need to add the live wallet
+        base balance captured during preflight, otherwise a live restart sees
+        zero base and incorrectly suppresses sells.
+        """
+        starting_base = self.config.starting_base_amount or Decimal("0")
+        return starting_base + self.get_current_base_position()

@@ -1,11 +1,15 @@
 import asyncio
 from decimal import Decimal
 from unittest import TestCase
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
+from bidict import bidict
+
+from hummingbot.connector.exchange.gemini import gemini_constants as CONSTANTS
 from hummingbot.connector.exchange.gemini.gemini_exchange import GeminiExchange
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 
 
 class GeminiExchangeTests(TestCase):
@@ -28,6 +32,18 @@ class GeminiExchangeTests(TestCase):
 
     def test_trading_pairs(self):
         self.assertEqual(["BTC-USD", "ETH-USD"], self.exchange.trading_pairs)
+
+    def test_get_last_traded_price_uses_generic_ticker_rate_limit_id(self):
+        self.exchange._set_trading_pair_symbol_map(bidict({"btcusd": "BTC-USD"}))
+        with patch.object(self.exchange, "_api_request", new=AsyncMock(return_value={"close": "123.45"})) as api_request:
+            price = self._async_run(self.exchange._get_last_traded_price("BTC-USD"))
+
+        self.assertEqual(123.45, price)
+        api_request.assert_awaited_once_with(
+            method=RESTMethod.GET,
+            path_url=CONSTANTS.TICKER_PATH_URL.format("btcusd"),
+            limit_id=CONSTANTS.TICKER_PATH_URL,
+        )
 
     def test_is_cancel_request_in_exchange_synchronous(self):
         self.assertTrue(self.exchange.is_cancel_request_in_exchange_synchronous)

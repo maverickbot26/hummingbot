@@ -248,6 +248,50 @@ class TradeFeeTests(TestCase):
 
         self.assertEqual(Decimal("0"), fee_amount)
 
+    def test_fee_amount_in_token_returns_zero_when_conversion_rate_is_zero(self):
+        class FakeExchange:
+            order_books = {"HBOT-COINALPHA": object()}
+
+            def get_price_by_type(self, trading_pair, price_type):
+                return Decimal("0")
+
+        fee = AddedToCostTradeFee(percent=Decimal("0.01"), percent_token="COINALPHA")
+
+        fee_amount = fee.fee_amount_in_token(
+            trading_pair="HBOT-COINALPHA",
+            price=Decimal("100"),
+            order_amount=Decimal("1"),
+            token="HBOT",
+            exchange=FakeExchange())
+
+        self.assertEqual(Decimal("0"), fee_amount)
+
+    def test_fee_amount_in_token_ignores_zero_flat_fees_without_conversion_rate(self):
+        fee = AddedToCostTradeFee(
+            percent=Decimal("0"),
+            flat_fees=[TokenAmount(token="BNB", amount=Decimal("0"))])
+
+        fee_amount = fee.fee_amount_in_token(
+            trading_pair="HBOT-COINALPHA",
+            price=Decimal("1000"),
+            order_amount=Decimal("1"),
+            token="HBOT")
+
+        self.assertEqual(Decimal("0"), fee_amount)
+
+    def test_fee_amount_in_token_returns_zero_when_conversion_rate_is_missing(self):
+        rate_source = type("MissingRateSource", (), {"get_pair_rate": lambda self, trading_pair: None})()
+        fee = DeductedFromReturnsTradeFee(percent=Decimal("0.01"), percent_token="USD")
+
+        fee_amount = fee.fee_amount_in_token(
+            trading_pair="ZEC-USD",
+            price=Decimal("500"),
+            order_amount=Decimal("0.002"),
+            token="ZEC",
+            rate_source=rate_source)
+
+        self.assertEqual(Decimal("0"), fee_amount)
+
 
 class TokenAmountTests(TestCase):
 
