@@ -45,6 +45,19 @@ Local tracking doc used because the upstream `origin` repository is read-only an
 - [x] Phase 4 PnL at live summary: portfolio `-$1.75256844` / `-0.270652%` during a ZEC move down; buy-and-hold benchmark `-$1.75480844` / `-0.270998%`; MM alpha `+$0.00224`.
 - [x] Read: Phase 4 healthy as a bounded operational gate. Go for Phase 5 only if Phase 5 is still mini/conservative and adds production monitoring/dashboard/alerting before any scale-up.
 
+## Phase 5 — Production Ops / Dashboard / Alerting (Mini Only)
+- [x] Re-verified launch safety on 2026-05-11 before Phase 5 artifact work: branch `pr-8027-gemini-connector`, clean at commit `96051be52`, no independent Hummingbot/V2/deadman process, Gemini ZEC-USD open orders `0`, balances `USD 330.54321104475` / `ZEC 0.569743`, read-only preflight two-sided at `0.002 ZEC` `LIMIT_MAKER` BUY+SELL.
+- [x] Scope locked: Phase 5 is production ops/readiness only, **not capital scale-up**. Initial live validation, if run, must reuse Phase 4 tiny bounds (`0.002 ZEC` order amount, max single `0.0025 ZEC`, max total remaining `0.0055 ZEC`, max 1 BUY + 1 SELL).
+- [x] Added read-only status/check/report artifact: `scripts/maverick/gemini_zec_phase5_status.py` outputs portfolio, open orders, stale/problem orders, latest live summary, warnings/errors, process state, watchdog/heartbeat status, and go/no-go read. It has `--check`, `--write-json`, and `--write-dashboard` modes and does not print secrets.
+- [x] Added unit coverage for Phase 5 alert bound logic: `test/scripts/maverick/test_gemini_zec_phase5_status.py`.
+- [x] Added local dashboard/report: `docs/maverick/gemini_zec_phase5_ops_dashboard.md`.
+- [x] Alerting/check routine: same status script exits non-zero on stale/open order bound breaches, duplicate/no-watchdog live process, warning/error blockers, latest non-clean summary, final open orders, or external-mid basis breach.
+- [x] Cron proposal documented but **not enabled** pending Eric approval for unattended production mini ops:
+  `*/5 * * * * cd /Users/maverick/hummingbot && micromamba run -n hummingbot python scripts/maverick/gemini_zec_phase5_status.py --check --write-dashboard docs/maverick/gemini_zec_phase5_ops_dashboard.md >> logs/gemini_zec_phase5_status_cron.log 2>&1`
+- [x] Phase 5 validation gate passed on 2026-05-11: targeted controller/Gemini/fee/status tests passed (`73 passed / 13 warnings`); paper sim matched two-sided `LIMIT_MAKER` tiny shape with `starting_base_amount`; read-only live preflight showed open orders `0`, two-sided BUY+SELL plan, current ZEC inventory within band, and external basis inside bound.
+- [x] Ran one bounded Phase 5 live ops validation for 10 minutes with deadman armed and Phase 4 tiny bounds. Result: one maker BUY fill (`0.002 ZEC`, `$1.12232` notional), zero reported fees, one resting SELL canceled at runtime stop, final Gemini ZEC-USD open orders `0`, no Hummingbot/deadman process left.
+- [x] Captured final Phase 5 status: USD `329.42089104475`, ZEC `0.571743`; final status monitor read Healthy with open orders `0`; latest live summary PnL `-$1.38735549`, buy-and-hold `-$1.38447549`, MM alpha `-$0.00288`. This is go for **supervised** mini ops only; unattended cron/automation remains not enabled until Eric explicitly approves.
+
 ## Live Gate Reminder
 Before any next live phase:
 1. No Hummingbot process should be running.
