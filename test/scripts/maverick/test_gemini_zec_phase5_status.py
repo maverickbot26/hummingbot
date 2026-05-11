@@ -46,3 +46,13 @@ class GeminiZECPhase5StatusTests(TestCase):
 
         self.assertIn("single_order_exceeds_bound:0.003>0.0025", alerts)
         self.assertIn("stale_orders:1", alerts)
+
+    def test_order_alerts_suppresses_stale_resting_order_during_supervised_live(self):
+        alerts = order_alerts(
+            orders=[{"side": "buy", "remaining_amount": "0.002"}],
+            stale=[{"side": "buy"}],
+            live_supervised=True,
+        )
+
+        self.assertNotIn("stale_orders:1", alerts)
+        self.assertEqual([], alerts)

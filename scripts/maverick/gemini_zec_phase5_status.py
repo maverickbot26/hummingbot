@@ -46,6 +46,13 @@ DASHBOARD_VERSION = 1
 class ProcessSnapshot:
     hummingbot: list[str]
     watchdog: list[str]
+    runner: list[str]
+    headless: list[str]
+    legacy: list[str]
+
+    @property
+    def active_supervised_v2(self) -> bool:
+        return bool(self.runner and self.headless and self.watchdog)
 
 
 def decimal_default(value: Any) -> str:
@@ -89,16 +96,14 @@ def heartbeat_state(path: Path = HEARTBEAT_FILE) -> dict[str, Any]:
 
 def process_snapshot() -> ProcessSnapshot:
     result = subprocess.run(["ps", "-axo", "pid=,command="], text=True, capture_output=True, check=True)
-    hummingbot_needles = (
-        "bin/hummingbot_quickstart.py",
-        "headless_no_mqtt_quickstart.py",
-        "v2_with_controllers",
-        "run_zec_tiny_supervised_pilot.py",
-        "run_gemini_zec_v2_tiny_live_smoke.py",
-    )
-    watchdog_needles = ("gemini_zec_deadman_watchdog.py",)
     current_pid = os.getpid()
-    hummingbot: list[str] = []
+    runner_needles = ("run_gemini_zec_v2_tiny_live_smoke.py",)
+    headless_needles = ("headless_no_mqtt_quickstart.py", "v2_with_controllers")
+    legacy_needles = ("bin/hummingbot_quickstart.py", "run_zec_tiny_supervised_pilot.py")
+    watchdog_needles = ("gemini_zec_deadman_watchdog.py",)
+    runner: list[str] = []
+    headless: list[str] = []
+    legacy: list[str] = []
     watchdog: list[str] = []
     for line in result.stdout.splitlines():
         stripped = line.strip()
@@ -111,11 +116,17 @@ def process_snapshot() -> ProcessSnapshot:
             continue
         if pid == current_pid or "pytest" in command or "--dry-run-preflight" in command:
             continue
-        if any(needle in command for needle in hummingbot_needles):
-            hummingbot.append(f"{pid} {command[:220]}")
+        rendered = f"{pid} {command[:220]}"
+        if any(needle in command for needle in runner_needles):
+            runner.append(rendered)
+        elif any(needle in command for needle in headless_needles):
+            headless.append(rendered)
+        elif any(needle in command for needle in legacy_needles):
+            legacy.append(rendered)
         if any(needle in command for needle in watchdog_needles):
-            watchdog.append(f"{pid} {command[:220]}")
-    return ProcessSnapshot(hummingbot=hummingbot, watchdog=watchdog)
+            watchdog.append(rendered)
+    hummingbot = runner + headless + legacy
+    return ProcessSnapshot(hummingbot=hummingbot, watchdog=watchdog, runner=runner, headless=headless, legacy=legacy)
 
 
 def stale_orders(orders: list[dict[str, Any]], now_ms: int | None = None) -> list[dict[str, Any]]:
@@ -168,7 +179,7 @@ def latest_log_findings(summary: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def order_alerts(orders: list[dict[str, Any]], stale: list[dict[str, Any]]) -> list[str]:
+def order_alerts(orders: list[dict[str, Any]], stale: list[dict[str, Any]], live_supervised: bool = False) -> list[str]:
     alerts: list[str] = []
     if len(orders) > MAX_OPEN_ORDERS:
         alerts.append(f"too_many_open_orders:{len(orders)}>{MAX_OPEN_ORDERS}")
@@ -178,7 +189,7 @@ def order_alerts(orders: list[dict[str, Any]], stale: list[dict[str, Any]]) -> l
         alerts.append(f"total_remaining_exceeds_bound:{total_remaining}>{MAX_TOTAL_REMAINING_ZEC}")
     if max_remaining > MAX_SINGLE_ORDER_ZEC:
         alerts.append(f"single_order_exceeds_bound:{max_remaining}>{MAX_SINGLE_ORDER_ZEC}")
-    if stale:
+    if stale and not live_supervised:
         alerts.append(f"stale_orders:{len(stale)}")
     return alerts
 
@@ -198,30 +209,42 @@ def build_status() -> dict[str, Any]:
     gemini = snapshot["mid"]
     basis_bp = Decimal("0") if coinbase == 0 else (gemini - coinbase) / coinbase * Decimal("10000")
 
+    live_supervised = processes.active_supervised_v2 and not heartbeat["stale"]
     alerts: list[str] = []
-    alerts.extend(order_alerts(orders, stale))
-    if len(processes.hummingbot) > 1:
-        alerts.append(f"duplicate_hummingbot_processes:{len(processes.hummingbot)}")
+    alerts.extend(order_alerts(orders, stale, live_supervised=live_supervised))
+    if live_supervised:
+        if len(processes.headless) != 1:
+            alerts.append(f"unexpected_live_headless_processes:{len(processes.headless)}")
+        if len(processes.runner) > 2:
+            alerts.append(f"duplicate_live_runner_processes:{len(processes.runner)}")
+        if processes.legacy:
+            alerts.append(f"unexpected_legacy_hummingbot_processes:{len(processes.legacy)}")
+    else:
+        if len(processes.hummingbot) > 1:
+            alerts.append(f"duplicate_hummingbot_processes:{len(processes.hummingbot)}")
     if processes.hummingbot and not processes.watchdog:
         alerts.append("hummingbot_running_without_deadman")
-    if findings["warnings"]:
+    if processes.watchdog and heartbeat["stale"]:
+        alerts.append("watchdog_heartbeat_stale")
+    if not live_supervised and findings["warnings"]:
         alerts.append("latest_warning_present")
-    if findings["errors"]:
+    if not live_supervised and findings["errors"]:
         alerts.append("latest_error_present")
-    if findings["recurring_blockers"]:
+    if not live_supervised and findings["recurring_blockers"]:
         alerts.append("recurring_log_blocker")
-    if summary and summary.get("final_open_orders") not in (0, "0", None):
+    if not live_supervised and summary and summary.get("final_open_orders") not in (0, "0", None):
         alerts.append(f"latest_summary_final_open_orders:{summary.get('final_open_orders')}")
-    if summary and summary.get("stop_reason") not in ("runtime_complete", None):
+    if not live_supervised and summary and summary.get("stop_reason") not in ("runtime_complete", None):
         alerts.append(f"latest_summary_stop_reason:{summary.get('stop_reason')}")
     if abs(basis_bp) > Decimal("50"):
         alerts.append(f"external_mid_basis_wide:{basis_bp:.2f}bp")
 
-    read = "Healthy" if not alerts and len(orders) == 0 else "stop condition"
+    read = "Live supervised healthy" if live_supervised and not alerts else ("Healthy" if not alerts and len(orders) == 0 else "stop condition")
     return {
         "schema_version": DASHBOARD_VERSION,
         "generated_at_epoch": int(time.time()),
         "mode": "phase5_read_only_status_no_orders_placed",
+        "live_supervised": live_supervised,
         "portfolio": {
             "mid": snapshot["mid"],
             "coinbase_mid": coinbase,
@@ -255,7 +278,13 @@ def build_status() -> dict[str, Any]:
             "errors": summary.get("errors", []) if summary else [],
         },
         "warnings_errors": findings,
-        "processes": {"hummingbot": processes.hummingbot, "watchdog": processes.watchdog},
+        "processes": {
+            "hummingbot": processes.hummingbot,
+            "watchdog": processes.watchdog,
+            "runner": processes.runner,
+            "headless": processes.headless,
+            "legacy": processes.legacy,
+        },
         "watchdog": {
             "required_when_live": True,
             "processes": processes.watchdog,
@@ -263,7 +292,7 @@ def build_status() -> dict[str, Any]:
             "status": "armed" if processes.watchdog else ("not_running_ok_no_live_process" if not processes.hummingbot else "missing"),
         },
         "alerts": alerts,
-        "go_no_go": "go_for_supervised_mini_ops" if read == "Healthy" else "no_go",
+        "go_no_go": "go_for_supervised_mini_ops" if read in ("Healthy", "Live supervised healthy") else "no_go",
         "read": read,
     }
 
@@ -288,6 +317,7 @@ def dashboard_markdown(status: dict[str, Any]) -> str:
         "",
         f"Generated epoch: `{status['generated_at_epoch']}`",
         f"Read: **{status['read']}** (`{status['go_no_go']}`)",
+        f"Live supervised: `{status.get('live_supervised')}`",
         "",
         "## Portfolio",
         f"- Total: **{fmt_money(portfolio['total_value_usd'])}**",
@@ -319,7 +349,7 @@ def dashboard_markdown(status: dict[str, Any]) -> str:
         "",
         "## Cron Proposal (not enabled)",
         "```cron",
-        "*/5 * * * * cd /Users/maverick/hummingbot && micromamba run -n hummingbot python scripts/maverick/gemini_zec_phase5_status.py --check --write-dashboard docs/maverick/gemini_zec_phase5_ops_dashboard.md >> logs/gemini_zec_phase5_status_cron.log 2>&1",
+        "*/5 * * * * cd /Users/maverick/hummingbot && /opt/homebrew/bin/micromamba run -n hummingbot python scripts/maverick/gemini_zec_phase5_status.py --check --write-json logs/gemini_zec_phase5_status_latest.json --write-dashboard docs/maverick/gemini_zec_phase5_ops_dashboard.md >> logs/gemini_zec_phase5_status_cron.log 2>&1",
         "```",
         "",
         "Keep cron disabled until Eric explicitly approves unattended production mini ops.",

@@ -60,6 +60,9 @@ MOVE_WINDOW_SECONDS = 300
 MOVE_THRESHOLD_BP = Decimal("300")
 BASIS_THRESHOLD_BP = Decimal("50")
 BASIS_DURATION_SECONDS = 60
+DEFAULT_DEADMAN_STALE_SECONDS = 45
+DEFAULT_HEARTBEAT_SECONDS = 10
+MAX_HEARTBEAT_STALE_RATIO = 3
 
 
 @dataclass
@@ -130,6 +133,36 @@ def assert_order_bounds(orders: list[dict[str, Any]]) -> None:
         raise RuntimeError(f"total_remaining_exceeds_tiny_bound: {total_remaining}")
     if max_remaining > MAX_SINGLE_ORDER_ZEC:
         raise RuntimeError(f"single_order_exceeds_tiny_bound: {max_remaining}")
+
+
+def validate_deadman_heartbeat_config(check_seconds: int, heartbeat_seconds: int, deadman_stale_seconds: int) -> None:
+    if check_seconds <= 0:
+        raise ValueError("check_seconds must be positive")
+    if heartbeat_seconds <= 0:
+        raise ValueError("heartbeat_seconds must be positive")
+    if deadman_stale_seconds <= 0:
+        raise ValueError("deadman_stale_seconds must be positive")
+    max_safe_heartbeat = deadman_stale_seconds / MAX_HEARTBEAT_STALE_RATIO
+    if heartbeat_seconds > max_safe_heartbeat:
+        raise ValueError(
+            "heartbeat_seconds must be <= deadman_stale_seconds/"
+            f"{MAX_HEARTBEAT_STALE_RATIO} ({max_safe_heartbeat:.1f}s); "
+            f"got heartbeat={heartbeat_seconds}s stale={deadman_stale_seconds}s"
+        )
+
+
+def write_heartbeat(path: Path = HEARTBEAT_FILE) -> None:
+    path.write_text(str(time.time()))
+
+
+def sleep_with_heartbeat(total_seconds: float, heartbeat_seconds: int, path: Path = HEARTBEAT_FILE) -> None:
+    deadline = time.time() + total_seconds
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(float(heartbeat_seconds), remaining))
+        write_heartbeat(path)
 
 
 class StaticMarketDataProvider:
@@ -252,7 +285,7 @@ def build_runtime_v2_config(v2_config: str, run_id: str, starting_base_amount: D
     return runtime_script_name
 
 
-def start_deadman(run_id: str) -> tuple[subprocess.Popen[Any], Path]:
+def start_deadman(run_id: str, stale_seconds: int) -> tuple[subprocess.Popen[Any], Path]:
     watchdog_log_path = LOG_DIR / f"maverick_zec_v2_deadman_{run_id}.log"
     env = os.environ.copy()
     env.update({
@@ -268,7 +301,7 @@ def start_deadman(run_id: str) -> tuple[subprocess.Popen[Any], Path]:
             "--heartbeat-file",
             str(HEARTBEAT_FILE),
             "--stale-seconds",
-            "45",
+            str(stale_seconds),
             "--poll-seconds",
             "10",
             "--cancel",
@@ -317,8 +350,11 @@ def main() -> int:
     parser.add_argument("--v2-config", default="gemini_zec_v2_tiny_live.yml")
     parser.add_argument("--runtime-seconds", type=int, default=12 * 60)
     parser.add_argument("--check-seconds", type=int, default=15)
+    parser.add_argument("--heartbeat-seconds", type=int, default=DEFAULT_HEARTBEAT_SECONDS)
+    parser.add_argument("--deadman-stale-seconds", type=int, default=DEFAULT_DEADMAN_STALE_SECONDS)
     parser.add_argument("--dry-run-preflight", action="store_true", help="Validate preconditions and exit before live launch")
     args = parser.parse_args()
+    validate_deadman_heartbeat_config(args.check_seconds, args.heartbeat_seconds, args.deadman_stale_seconds)
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     run_id = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
@@ -375,8 +411,8 @@ def main() -> int:
         watchdog_proc: subprocess.Popen[Any] | None = None
         watchdog_log_path: Path | None = None
 
-        HEARTBEAT_FILE.write_text(str(time.time()))
-        watchdog_proc, watchdog_log_path = start_deadman(run_id)
+        write_heartbeat()
+        watchdog_proc, watchdog_log_path = start_deadman(run_id, args.deadman_stale_seconds)
         hb_log = hb_log_path.open("w")
         cmd = [sys.executable, "scripts/maverick/headless_no_mqtt_quickstart.py", "--v2", runtime_v2_config]
         proc = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=hb_log, stderr=subprocess.STDOUT)
@@ -396,13 +432,18 @@ def main() -> int:
                 "max_single_order_zec": MAX_SINGLE_ORDER_ZEC,
                 "max_total_remaining_zec": MAX_TOTAL_REMAINING_ZEC,
             },
+            "deadman": {
+                "stale_seconds": args.deadman_stale_seconds,
+                "heartbeat_seconds": args.heartbeat_seconds,
+                "check_seconds": args.check_seconds,
+            },
         })
 
         deadline = time.time() + args.runtime_seconds
         log_offset = 0
         try:
             while time.time() < deadline:
-                HEARTBEAT_FILE.write_text(str(time.time()))
+                write_heartbeat()
                 if watchdog_proc and watchdog_proc.poll() is not None:
                     stop_reason = f"deadman_exited_{watchdog_proc.returncode}"
                     break
@@ -456,7 +497,7 @@ def main() -> int:
                     "basis_bp": basis_bp,
                     "orders": sanitize_orders(orders),
                 })
-                time.sleep(args.check_seconds)
+                sleep_with_heartbeat(args.check_seconds, args.heartbeat_seconds)
         except (urllib.error.URLError, urllib.error.HTTPError, RuntimeError) as exc:
             stop_reason = f"monitor_error_{type(exc).__name__}"
             errors.append(str(exc)[:500])
@@ -482,6 +523,9 @@ def main() -> int:
             "controller_preflight": preflight_plan,
             "started_ms": started_ms,
             "runtime_seconds_requested": args.runtime_seconds,
+            "check_seconds": args.check_seconds,
+            "heartbeat_seconds": args.heartbeat_seconds,
+            "deadman_stale_seconds": args.deadman_stale_seconds,
             "stop_reason": stop_reason,
             "hummingbot_returncode": proc.returncode,
             "watchdog_returncode": watchdog_proc.returncode if watchdog_proc else None,
