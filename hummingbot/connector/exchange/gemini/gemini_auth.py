@@ -104,21 +104,48 @@ class GeminiAuth(AuthBase):
             "X-GEMINI-SIGNATURE": signature,
         }
 
-    _last_nonce: int = 0
+    def get_legacy_ws_auth_headers(self, request_path: str) -> Dict[str, str]:
+        """Generate Gemini v1 order-events WebSocket auth headers.
 
-    def _get_nonce(self) -> int:
-        """Nonce must be in seconds and within 30s of Gemini server time.
-        We ensure monotonic increase to avoid collisions on rapid requests,
-        but reset if the counter drifted too far ahead (e.g., after clock correction)."""
+        The legacy order-events stream signs the same JSON payload format as REST:
+        {"request": "/v1/order/events", "nonce": <nonce>}. Unlike the Fast API,
+        it does not use X-GEMINI-NONCE and does not sign a bare base64 nonce.
+        """
+        payload_dict = {"request": request_path, "nonce": self._get_nonce()}
+        payload_json = json.dumps(payload_dict)
+        payload_b64 = base64.b64encode(payload_json.encode("utf-8"))
+
+        signature = hmac.new(
+            self.secret_key.encode("utf-8"),
+            payload_b64,
+            hashlib.sha384
+        ).hexdigest()
+
+        return {
+            "X-GEMINI-APIKEY": self.api_key,
+            "X-GEMINI-PAYLOAD": payload_b64.decode("utf-8"),
+            "X-GEMINI-SIGNATURE": signature,
+        }
+
+    _last_nonce: float = 0
+
+    def _get_nonce(self) -> str:
+        """Return a strictly increasing nonce that stays close to wall-clock seconds.
+
+        Gemini rejects nonces that are more than ~30 seconds away from server time.
+        Using integer seconds and incrementing by 1 for rapid requests can drift outside
+        that window after a small burst. Gemini accepts fractional-second nonces, so use
+        microsecond precision and only bump by one microsecond on same-tick collisions.
+        """
         if self.time_provider is not None:
-            nonce = int(self.time_provider.time())
+            nonce = float(self.time_provider.time())
         else:
-            nonce = int(time.time())
-        # Reset counter if it drifted more than 15 seconds ahead of current time
+            nonce = time.time()
+        # Reset counter if it drifted too far ahead of current time.
         if GeminiAuth._last_nonce > nonce + 15:
             GeminiAuth._last_nonce = 0
         # Ensure strictly increasing nonce for rapid sequential requests
         if nonce <= GeminiAuth._last_nonce:
-            nonce = GeminiAuth._last_nonce + 1
+            nonce = GeminiAuth._last_nonce + 0.000001
         GeminiAuth._last_nonce = nonce
-        return nonce
+        return f"{nonce:.6f}"

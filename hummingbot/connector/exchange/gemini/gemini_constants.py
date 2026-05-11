@@ -4,6 +4,7 @@ from hummingbot.core.data_type.in_flight_order import OrderState
 # Base URLs
 REST_URL = "https://api.gemini.com"
 WSS_FAST_API_URL = "wss://wsapi.fast.gemini.com"
+WSS_ORDER_EVENTS_URL = "wss://api.gemini.com/v1/order/events"
 
 # REST API versions / paths
 # Public
@@ -13,6 +14,7 @@ TICKER_PATH_URL = "/v2/ticker/{}"
 ORDER_BOOK_PATH_URL = "/v1/book/{}"
 
 # Private
+ORDER_EVENTS_PATH_URL = "/v1/order/events"
 NEW_ORDER_PATH_URL = "/v1/order/new"
 CANCEL_ORDER_PATH_URL = "/v1/order/cancel"
 ORDER_STATUS_PATH_URL = "/v1/order/status"
