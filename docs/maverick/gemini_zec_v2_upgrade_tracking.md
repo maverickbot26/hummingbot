@@ -21,12 +21,20 @@ Local tracking doc used because the upstream `origin` repository is read-only an
 - [x] Add a Gemini ZEC-USD V2 tiny maker-only controller matching the V1 one-bid/one-ask shape.
 - [x] Add paper/sim dry-run harness with duplicate-process guard and JSON metrics output.
 - [x] Validate quote shape, hard order-size cap, inventory deviation guard, external-mid sanity pause, volatility pause, and metrics schema in unit tests.
-- [ ] Run V2 live smoke — explicitly out of scope for this subagent.
+
+## Phase 3 — Tiny V2 Live Smoke
+- [x] Added a one-shot controller option so the Phase 3 live smoke cannot continuously recycle filled levels.
+- [x] Added a V2-capable no-MQTT headless launch path and strict live supervisor (`run_gemini_zec_v2_tiny_live_smoke.py`).
+- [x] Added local safe V2 config files: `conf/scripts/gemini_zec_v2_tiny_live.yml` and `conf/controllers/market_making/gemini_zec_pmm_tiny_live.yml`.
+- [x] Re-ran tests and dry-run before live: 44 passed / 13 warnings; dry-run matched maker-only tiny shape.
+- [x] Ran 12-minute supervised V2 live smoke on 2026-05-11 with deadman armed; final Gemini ZEC-USD open orders = 0.
+- [ ] Before Phase 4, investigate why live V2 submitted only the buy side and logged recurring `last traded price` lookup warnings plus zero-fee `DivisionByZero` fee-display warnings.
 
 ## Live Gate Reminder
-Before Phase 3 tiny V2 live smoke:
+Before any next live phase:
 1. No Hummingbot process should be running.
 2. Gemini open orders must be zero.
 3. Re-run connector + controller tests.
 4. Run V2 dry-run and inspect metrics.
-5. Use tiny maker-only size only; do not leave live orders open.
+5. Use maker-only size caps; do not leave live orders open.
+6. For Phase 4 specifically, prove two-sided V2 live order submission and clean up the live warning noise first.

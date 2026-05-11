@@ -1,0 +1,28 @@
+id: gemini_zec_v2_tiny_live
+controller_name: gemini_zec_pmm_tiny
+controller_type: market_making
+connector_name: gemini
+trading_pair: ZEC-USD
+buy_spreads:
+  - 0.001
+sell_spreads:
+  - 0.001
+buy_amounts_pct:
+  - 1
+sell_amounts_pct:
+  - 1
+order_amount_base: 0.002
+max_order_size_base: 0.002
+executor_refresh_time: 900
+cooldown_time: 900
+leverage: 1
+skip_rebalance: true
+zero_fee_accounting: true
+target_base_amount: 0.568
+max_inventory_deviation_base: 0.010
+max_external_mid_deviation_pct: 0.01
+volatility_pause_enabled: true
+max_mid_move_pct: 0.02
+manual_pause: false
+one_shot_mode: true
+metrics_schema_version: 1

@@ -39,7 +39,8 @@ def noop_mqtt_start(self: HummingbotApplication, timeout: float = 30.0) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-f", "--config-file-name", required=True, help="Strategy YAML in conf/strategies")
+    parser.add_argument("-f", "--config-file-name", help="Strategy YAML in conf/strategies")
+    parser.add_argument("--v2", dest="v2_conf", help="V2 script config YAML in conf/scripts")
     parser.add_argument(
         "--password-keychain-service",
         default="hummingbot-config-password",
@@ -47,11 +48,14 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if bool(args.config_file_name) == bool(args.v2_conf):
+        parser.error("Specify exactly one of --config-file-name/-f or --v2")
+
     HummingbotApplication.mqtt_start = noop_mqtt_start  # type: ignore[method-assign]
 
     quickstart_args = argparse.Namespace(
         config_file_name=args.config_file_name,
-        v2_conf=None,
+        v2_conf=args.v2_conf,
         config_password=keychain(args.password_keychain_service),
         auto_set_permissions=None,
         headless=True,

@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from pydantic import Field
 
@@ -43,6 +43,7 @@ class GeminiZECTinyPMMConfig(MarketMakingControllerConfigBase):
     volatility_pause_enabled: bool = True
     max_mid_move_pct: Decimal = Field(default=Decimal("0.02"), gt=Decimal("0"))
     manual_pause: bool = False
+    one_shot_mode: bool = True
     metrics_schema_version: int = 1
 
 
@@ -55,6 +56,7 @@ class GeminiZECTinyPMMController(MarketMakingControllerBase):
         self._last_inventory_suppressed_sides: List[str] = []
         self._last_quote_prices: Dict[str, str] = {}
         self._last_quote_amounts: Dict[str, str] = {}
+        self._one_shot_started_level_ids: Set[str] = set()
 
     async def update_processed_data(self):
         await super().update_processed_data()
@@ -86,7 +88,19 @@ class GeminiZECTinyPMMController(MarketMakingControllerBase):
     def create_actions_proposal(self) -> List[ExecutorAction]:
         if self.processed_data.get("paused"):
             return []
-        return super().create_actions_proposal()
+        actions = super().create_actions_proposal()
+        if not self.config.one_shot_mode:
+            return actions
+        filtered_actions: List[ExecutorAction] = []
+        for action in actions:
+            if isinstance(action, CreateExecutorAction):
+                level_id = action.executor_config.level_id
+                if level_id in self._one_shot_started_level_ids:
+                    continue
+                if level_id is not None:
+                    self._one_shot_started_level_ids.add(level_id)
+            filtered_actions.append(action)
+        return filtered_actions
 
     def get_levels_to_execute(self) -> List[str]:
         level_ids = super().get_levels_to_execute()
@@ -152,6 +166,8 @@ class GeminiZECTinyPMMController(MarketMakingControllerBase):
             "target_base_amount": str(self.config.target_base_amount) if self.config.target_base_amount is not None else None,
             "max_inventory_deviation_base": str(self.config.max_inventory_deviation_base),
             "inventory_suppressed_sides": list(self._last_inventory_suppressed_sides),
+            "one_shot_mode": self.config.one_shot_mode,
+            "one_shot_started_level_ids": sorted(self._one_shot_started_level_ids),
             "last_quote_prices": dict(self._last_quote_prices),
             "last_quote_amounts": dict(self._last_quote_amounts),
         }

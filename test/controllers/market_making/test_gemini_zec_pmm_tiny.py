@@ -116,6 +116,25 @@ class GeminiZECTinyPMMControllerTests(TestCase):
         self.assertTrue(metrics["paused"])
         self.assertIn("external_mid_deviation", metrics["pause_reasons"])
 
+    def test_one_shot_mode_prevents_replacement_after_initial_levels(self):
+        controller = self.make_controller()
+        self.async_run(controller.update_processed_data())
+
+        first_actions = controller.determine_executor_actions()
+        second_actions = controller.determine_executor_actions()
+
+        self.assertEqual({"buy_0", "sell_0"}, {action.executor_config.level_id for action in first_actions})
+        self.assertEqual([], second_actions)
+        self.assertEqual(["buy_0", "sell_0"], controller.get_custom_info()["one_shot_started_level_ids"])
+
+    def test_one_shot_mode_can_be_disabled(self):
+        controller = self.make_controller(one_shot_mode=False)
+        self.async_run(controller.update_processed_data())
+
+        self.assertEqual(2, len(controller.determine_executor_actions()))
+        self.assertEqual(2, len(controller.determine_executor_actions()))
+        self.assertFalse(controller.get_custom_info()["one_shot_mode"])
+
     def test_volatility_pause_blocks_second_tick_after_large_mid_move(self):
         controller = self.make_controller(price=Decimal("562.335"), max_mid_move_pct=Decimal("0.01"))
         self.async_run(controller.update_processed_data())

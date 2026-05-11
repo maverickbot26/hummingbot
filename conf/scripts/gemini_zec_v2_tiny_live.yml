@@ -1,0 +1,5 @@
+script_file_name: v2_with_controllers.py
+controllers_config:
+  - market_making/gemini_zec_pmm_tiny_live.yml
+max_global_drawdown_quote: 5
+max_controller_drawdown_quote: 5
