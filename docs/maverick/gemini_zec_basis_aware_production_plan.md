@@ -68,17 +68,17 @@ Recommended initial thresholds for tiny supervised production:
 | State | Condition | Action |
 |---|---:|---|
 | normal | `abs(basis_bp) <= 25 bp` | two-sided PMM (`BUY` + `SELL`) |
-| rich candidate | `basis_bp >= +30 bp` | do not act until confirmed |
-| rich confirmed | `basis_bp >= +30 bp` for 3 fresh samples spanning at least 30s | sell-only on Gemini; suppress BUY |
-| cheap candidate | `basis_bp <= -30 bp` | do not act until confirmed |
-| cheap confirmed | `basis_bp <= -30 bp` for 3 fresh samples spanning at least 30s | buy-only on Gemini; suppress SELL |
-| directional exit / hysteresis | confirmed directional state returns inside `abs(basis_bp) < 20 bp` | stop directional mode; next run/preflight may return to two-sided |
-| elevated-but-unconfirmed | `25 < abs(basis_bp) < 30 bp`, mixed signs, or too few confirming samples | halt/no quote |
+| rich probe candidate | `+25 bp < basis_bp < +75 bp` | do not act until confirmed |
+| rich probe confirmed | `+25 bp < basis_bp < +75 bp` for 3 fresh same-sign samples spanning at least 30s | sell-only on Gemini; suppress BUY |
+| cheap probe candidate | `-75 bp < basis_bp < -25 bp` | do not act until confirmed |
+| cheap probe confirmed | `-75 bp < basis_bp < -25 bp` for 3 fresh same-sign samples spanning at least 30s | buy-only on Gemini; suppress SELL |
+| directional exit | confirmed directional state returns inside `abs(basis_bp) <= 25 bp` | stop directional mode; next run/preflight may return to two-sided |
+| elevated-but-unconfirmed | mixed signs, too few confirming samples, stale samples, or `abs(basis_bp) >= 75 bp` before sustained confirmation | halt/no quote |
 | sustained wide | `abs(basis_bp) >= 75 bp` for 60s | halt/cancel live run |
 | extreme | `abs(basis_bp) >= 100 bp` once | immediate halt/no quote |
 | bad data | missing/zero/negative/non-numeric mid, HTTP/API error, stale sample, or timestamp gap | halt/no quote |
 
-Rationale: current `50 bp` hard halt is too conservative because it discards useful signal. The directional band allows moderate, confirmed basis to choose the safer side while preserving a hard stop for extreme dislocation.
+Rationale: current `50 bp` hard halt is too conservative because it discards useful signal. The supervised probe band allows modest confirmed basis to choose the safer side while preserving a hard stop for sustained/extreme dislocation. Probe mode intentionally does **not** require the old `30 bp` entry threshold; once outside the normal `25 bp` band, same-sign fresh samples spanning the confirmation window are enough for this tiny supervised data-collection mode.
 
 ## Data freshness / confirmation rules
 
@@ -105,8 +105,8 @@ Suggested objects/functions:
 
 - `BasisPolicyConfig`
   - `normal_bp=25`
-  - `entry_bp=30`
-  - `exit_bp=20`
+  - `entry_bp=30` (legacy compatibility knob; no longer required for supervised probe entry)
+  - `exit_bp=20` (legacy compatibility knob; directional exit now uses the normal `25 bp` band)
   - `sustained_halt_bp=75`
   - `extreme_halt_bp=100`
   - `confirmation_samples=3`
@@ -226,9 +226,9 @@ Add or update tests for:
 
 - `signed_basis_bp` positive/negative/zero and invalid Coinbase zero.
 - normal basis -> two-sided decision.
-- rich confirmed -> SELL-only decision after 3 samples / 30s.
-- cheap confirmed -> BUY-only decision after 3 samples / 30s.
-- unconfirmed/elevated -> halt.
+- rich confirmed/probe -> SELL-only decision after 3 samples / 30s, including modest `25-30 bp` basis.
+- cheap confirmed/probe -> BUY-only decision after 3 samples / 30s, including modest `25-30 bp` basis.
+- unconfirmed/elevated/wide outside probe band -> halt.
 - stale/failed sample -> halt.
 - sustained wide -> halt after 60s.
 - extreme -> immediate halt.
@@ -275,6 +275,7 @@ Do not start live trading as part of this planning step.
 - [x] Update or add tests for controller, runner preflight, ops, and status.
 - [x] Run focused pytest commands and report exact results.
 - [x] Do not run live trading, enable cron, scale capital, or mark production/unattended complete without Eric’s explicit approval.
+- [x] 2026-05-12 supervised probe amendment: allow one-sided tiny probe for confirmed same-sign `25 < abs(basis) < 75 bp` without waiting for the old `30 bp` entry threshold; keep stale/missing/mixed-sign data as halt; keep `>=75 bp` sustained / `>=100 bp` extreme halts; keep cron disabled and tiny bounds unchanged.
 
 
 ## Step 2 implementation notes
@@ -288,3 +289,14 @@ Do not start live trading as part of this planning step.
   - `/opt/homebrew/bin/micromamba run -n hummingbot python -m pytest test/scripts/maverick/test_gemini_zec_v2_ops.py -q` -> `13 passed, 6 warnings`.
   - `/opt/homebrew/bin/micromamba run -n hummingbot python -m pytest test/scripts/maverick/test_gemini_zec_phase5_status.py -q` -> `7 passed, 6 warnings`.
 - No live trading command was run; no cron/unattended mode was enabled; capital/order-size bounds remain unchanged.
+
+## 2026-05-12 supervised probe-mode amendment
+
+Eric approved a supervised data-collection probe mode for the gray zone that previously halted around `25-30 bp`. The policy is now:
+
+- `abs(basis) <= 25 bp`: normal two-sided tiny PMM.
+- `25 < abs(basis) < 75 bp` with 3 fresh same-sign samples spanning the confirmation window: one-sided probe. Gemini rich => SELL-only; Gemini cheap => BUY-only.
+- The old `30 bp` entry threshold is not required for supervised probe entry.
+- Mixed sign, missing/bad/stale data, too few samples, or samples outside the probe band halt/no-quote.
+- Sustained `>=75 bp` or one-shot `>=100 bp` remains halt/cancel.
+- Live runs remain supervised-only with deadman, `LIMIT_MAKER`, `0.002 ZEC` order size, `0.0025 ZEC` max single, `0.0055 ZEC` max total remaining, max 2 orders, no cron/unattended mode, and no scale-up.

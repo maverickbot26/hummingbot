@@ -46,6 +46,14 @@ class GeminiZECBasisPolicyTests(TestCase):
         self.assertEqual(["BUY"], decision.suppress_sides)
         self.assertTrue(decision.confirmed)
 
+    def test_modest_rich_probe_above_25bp_is_sell_only_after_confirmation(self):
+        decision = decide_basis_state(self.samples([(70, Decimal("100.26")), (85, Decimal("100.27")), (100, Decimal("100.28"))]), now=Decimal("100"))
+
+        self.assertEqual(STATE_RICH_SELL_ONLY, decision.state)
+        self.assertEqual(["SELL"], decision.allowed_sides)
+        self.assertEqual("gemini_rich_probe_sell_only:28.0000bp", decision.reason)
+        self.assertTrue(decision.confirmed)
+
     def test_cheap_confirmed_is_buy_only_after_three_samples_and_30s(self):
         decision = decide_basis_state(self.samples([(70, Decimal("99.69")), (85, Decimal("99.68")), (100, Decimal("99.67"))]), now=Decimal("100"))
 
@@ -54,9 +62,17 @@ class GeminiZECBasisPolicyTests(TestCase):
         self.assertEqual(["SELL"], decision.suppress_sides)
         self.assertTrue(decision.confirmed)
 
+    def test_modest_cheap_probe_below_25bp_is_buy_only_after_confirmation(self):
+        decision = decide_basis_state(self.samples([(70, Decimal("99.74")), (85, Decimal("99.73")), (100, Decimal("99.72"))]), now=Decimal("100"))
+
+        self.assertEqual(STATE_CHEAP_BUY_ONLY, decision.state)
+        self.assertEqual(["BUY"], decision.allowed_sides)
+        self.assertEqual("gemini_cheap_probe_buy_only:-28.0000bp", decision.reason)
+        self.assertTrue(decision.confirmed)
+
     def test_previous_directional_state_stays_valid_with_fresh_same_side_sample(self):
         decision = decide_basis_state(
-            self.samples([(100, Decimal("100.32"))]),
+            self.samples([(100, Decimal("100.27"))]),
             now=Decimal("100"),
             previous_state=STATE_RICH_SELL_ONLY,
         )
@@ -82,6 +98,13 @@ class GeminiZECBasisPolicyTests(TestCase):
         decision = decide_basis_state(self.samples([(40, Decimal("100.80")), (70, Decimal("100.82")), (100, Decimal("100.81"))]), now=Decimal("100"))
 
         self.assertEqual(STATE_HALT_SUSTAINED_WIDE, decision.state)
+        self.assertTrue(decision.halt)
+
+    def test_wide_not_yet_sustained_basis_does_not_probe_quote(self):
+        decision = decide_basis_state(self.samples([(100, Decimal("100.80"))]), now=Decimal("100"))
+
+        self.assertEqual(STATE_HALT_UNCONFIRMED, decision.state)
+        self.assertEqual([], decision.allowed_sides)
         self.assertTrue(decision.halt)
 
     def test_extreme_basis_halts_immediately(self):

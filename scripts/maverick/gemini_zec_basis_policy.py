@@ -30,6 +30,9 @@ HALT_STATES = {STATE_HALT_UNCONFIRMED, STATE_HALT_STALE, STATE_HALT_EXTREME, STA
 @dataclass(frozen=True)
 class BasisPolicyConfig:
     normal_bp: Decimal = Decimal("25")
+    # Legacy hysteresis knob kept for config/backward compatibility. Supervised
+    # probe entry no longer waits for this 30 bp threshold; confirmed same-sign
+    # samples outside normal_bp and inside sustained_halt_bp are enough.
     entry_bp: Decimal = Decimal("30")
     exit_bp: Decimal = Decimal("20")
     sustained_halt_bp: Decimal = Decimal("75")
@@ -242,32 +245,22 @@ def decide_basis_state(
                 now=now_dec,
             )
 
-    if previous_state in DIRECTIONAL_STATES and abs(latest.basis_bp) < config.exit_bp:
+    if previous_state in DIRECTIONAL_STATES and abs(latest.basis_bp) <= config.normal_bp:
         return _decision(
             state=STATE_NORMAL,
             allowed_sides=ALL_SIDES,
-            reason=f"directional_exit_basis_inside_{config.exit_bp}bp",
+            reason=f"directional_exit_basis_inside_{config.normal_bp}bp",
             basis_bp=latest.basis_bp,
             confirmed=True,
             samples=ordered,
             now=now_dec,
         )
 
-    if previous_state == STATE_RICH_SELL_ONLY and latest.basis_bp < config.entry_bp:
+    if abs(latest.basis_bp) >= config.sustained_halt_bp:
         return _decision(
             state=STATE_HALT_UNCONFIRMED,
             allowed_sides=[],
-            reason=f"rich_direction_no_longer_confirmed:{latest.basis_bp}bp",
-            basis_bp=latest.basis_bp,
-            confirmed=False,
-            samples=ordered,
-            now=now_dec,
-        )
-    if previous_state == STATE_CHEAP_BUY_ONLY and latest.basis_bp > -config.entry_bp:
-        return _decision(
-            state=STATE_HALT_UNCONFIRMED,
-            allowed_sides=[],
-            reason=f"cheap_direction_no_longer_confirmed:{latest.basis_bp}bp",
+            reason=f"basis_outside_supervised_probe_band:{latest.basis_bp}bp",
             basis_bp=latest.basis_bp,
             confirmed=False,
             samples=ordered,
@@ -285,21 +278,21 @@ def decide_basis_state(
             now=now_dec,
         )
 
-    if previous_state == STATE_RICH_SELL_ONLY and latest.basis_bp >= config.entry_bp:
+    if previous_state == STATE_RICH_SELL_ONLY and latest.basis_bp > config.normal_bp:
         return _decision(
             state=STATE_RICH_SELL_ONLY,
             allowed_sides=[SELL],
-            reason=f"previous_rich_basis_still_valid:{latest.basis_bp}bp",
+            reason=f"previous_rich_probe_still_valid:{latest.basis_bp}bp",
             basis_bp=latest.basis_bp,
             confirmed=True,
             samples=ordered,
             now=now_dec,
         )
-    if previous_state == STATE_CHEAP_BUY_ONLY and latest.basis_bp <= -config.entry_bp:
+    if previous_state == STATE_CHEAP_BUY_ONLY and latest.basis_bp < -config.normal_bp:
         return _decision(
             state=STATE_CHEAP_BUY_ONLY,
             allowed_sides=[BUY],
-            reason=f"previous_cheap_basis_still_valid:{latest.basis_bp}bp",
+            reason=f"previous_cheap_probe_still_valid:{latest.basis_bp}bp",
             basis_bp=latest.basis_bp,
             confirmed=True,
             samples=ordered,
@@ -328,13 +321,13 @@ def decide_basis_state(
             samples=ordered,
             now=now_dec,
         )
-    rich_confirmed = all(sample.basis_bp >= config.entry_bp for sample in confirming)
-    cheap_confirmed = all(sample.basis_bp <= -config.entry_bp for sample in confirming)
+    rich_confirmed = all(config.normal_bp < sample.basis_bp < config.sustained_halt_bp for sample in confirming)
+    cheap_confirmed = all(-config.sustained_halt_bp < sample.basis_bp < -config.normal_bp for sample in confirming)
     if rich_confirmed:
         return _decision(
             state=STATE_RICH_SELL_ONLY,
             allowed_sides=[SELL],
-            reason=f"gemini_rich_confirmed_sell_only:{latest.basis_bp}bp",
+            reason=f"gemini_rich_probe_sell_only:{latest.basis_bp}bp",
             basis_bp=latest.basis_bp,
             confirmed=True,
             samples=ordered,
@@ -344,7 +337,7 @@ def decide_basis_state(
         return _decision(
             state=STATE_CHEAP_BUY_ONLY,
             allowed_sides=[BUY],
-            reason=f"gemini_cheap_confirmed_buy_only:{latest.basis_bp}bp",
+            reason=f"gemini_cheap_probe_buy_only:{latest.basis_bp}bp",
             basis_bp=latest.basis_bp,
             confirmed=True,
             samples=ordered,
