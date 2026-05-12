@@ -18,6 +18,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from scripts.maverick.gemini_zec_basis_policy import BasisPolicyConfig, basis_direction_label
 from scripts.maverick.run_gemini_zec_v2_tiny_live_smoke import (
     HEARTBEAT_FILE,
     MAX_OPEN_ORDERS,
@@ -39,7 +40,8 @@ LOG_DIR = REPO_ROOT / "logs"
 DEFAULT_DASHBOARD_PATH = REPO_ROOT / "docs" / "maverick" / "gemini_zec_phase5_ops_dashboard.md"
 DEFAULT_JSON_PATH = LOG_DIR / "gemini_zec_phase5_status_latest.json"
 STALE_ORDER_SECONDS = 10 * 60
-DASHBOARD_VERSION = 1
+DASHBOARD_VERSION = 2
+BASIS_STATUS_CONFIG = BasisPolicyConfig()
 
 
 @dataclass(frozen=True)
@@ -179,7 +181,12 @@ def latest_log_findings(summary: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def order_alerts(orders: list[dict[str, Any]], stale: list[dict[str, Any]], live_supervised: bool = False) -> list[str]:
+def order_alerts(
+    orders: list[dict[str, Any]],
+    stale: list[dict[str, Any]],
+    live_supervised: bool = False,
+    basis_allowed_sides: list[str] | None = None,
+) -> list[str]:
     alerts: list[str] = []
     if len(orders) > MAX_OPEN_ORDERS:
         alerts.append(f"too_many_open_orders:{len(orders)}>{MAX_OPEN_ORDERS}")
@@ -191,7 +198,25 @@ def order_alerts(orders: list[dict[str, Any]], stale: list[dict[str, Any]], live
         alerts.append(f"single_order_exceeds_bound:{max_remaining}>{MAX_SINGLE_ORDER_ZEC}")
     if stale and not live_supervised:
         alerts.append(f"stale_orders:{len(stale)}")
+    if basis_allowed_sides is not None:
+        allowed = {side.lower() for side in basis_allowed_sides}
+        invalid_sides = sorted({str(order.get("side", "")).lower() for order in orders if str(order.get("side", "")).lower() not in allowed})
+        if invalid_sides:
+            alerts.append(f"open_order_side_violates_basis_policy:{','.join(invalid_sides)}")
     return alerts
+
+
+def latest_basis_policy(summary: dict[str, Any] | None) -> dict[str, Any]:
+    if not summary:
+        return {}
+    policy = summary.get("basis_policy") or {}
+    if isinstance(policy.get("latest"), dict):
+        return policy.get("latest") or {}
+    if isinstance(policy.get("preflight"), dict):
+        return policy.get("preflight") or {}
+    if isinstance(policy, dict):
+        return policy
+    return {}
 
 
 def build_status() -> dict[str, Any]:
@@ -202,16 +227,19 @@ def build_status() -> dict[str, Any]:
     sells = [order for order in orders if str(order.get("side", "")).lower() == "sell"]
     stale = stale_orders(orders)
     summary_path, summary = latest_summary()
+    latest_policy = latest_basis_policy(summary)
     findings = latest_log_findings(summary)
     processes = process_snapshot()
     heartbeat = heartbeat_state()
     coinbase = coinbase_mid()
     gemini = snapshot["mid"]
     basis_bp = Decimal("0") if coinbase == 0 else (gemini - coinbase) / coinbase * Decimal("10000")
+    basis_direction = basis_direction_label(basis_bp)
+    policy_allowed_sides = latest_policy.get("allowed_sides") if isinstance(latest_policy.get("allowed_sides"), list) else None
 
     live_supervised = processes.active_supervised_v2 and not heartbeat["stale"]
     alerts: list[str] = []
-    alerts.extend(order_alerts(orders, stale, live_supervised=live_supervised))
+    alerts.extend(order_alerts(orders, stale, live_supervised=live_supervised, basis_allowed_sides=policy_allowed_sides))
     if live_supervised:
         if len(processes.headless) != 1:
             alerts.append(f"unexpected_live_headless_processes:{len(processes.headless)}")
@@ -236,8 +264,18 @@ def build_status() -> dict[str, Any]:
         alerts.append(f"latest_summary_final_open_orders:{summary.get('final_open_orders')}")
     if not live_supervised and summary and summary.get("stop_reason") not in ("runtime_complete", None):
         alerts.append(f"latest_summary_stop_reason:{summary.get('stop_reason')}")
-    if abs(basis_bp) > Decimal("50"):
-        alerts.append(f"external_mid_basis_wide:{basis_bp:.2f}bp")
+    if coinbase <= 0:
+        alerts.append("basis_policy_stale")
+    elif abs(basis_bp) >= BASIS_STATUS_CONFIG.extreme_halt_bp:
+        alerts.append(f"basis_policy_halt_extreme:{basis_bp:.2f}bp")
+    elif abs(basis_bp) > BASIS_STATUS_CONFIG.normal_bp:
+        state = latest_policy.get("state")
+        if state == "gemini_rich_sell_only":
+            alerts.append(f"basis_directional_sell_only:{basis_bp:.2f}bp")
+        elif state == "gemini_cheap_buy_only":
+            alerts.append(f"basis_directional_buy_only:{basis_bp:.2f}bp")
+        else:
+            alerts.append(f"basis_policy_unconfirmed:{basis_bp:.2f}bp")
 
     read = "Live supervised healthy" if live_supervised and not alerts else ("Healthy" if not alerts and len(orders) == 0 else "stop condition")
     return {
@@ -249,6 +287,9 @@ def build_status() -> dict[str, Any]:
             "mid": snapshot["mid"],
             "coinbase_mid": coinbase,
             "basis_bp": basis_bp,
+            "basis_direction": basis_direction,
+            "basis_policy_state": latest_policy.get("state"),
+            "basis_policy_reason": latest_policy.get("reason"),
             "USD": snapshot["USD"],
             "ZEC": snapshot["ZEC"],
             "zec_value_usd": snapshot["ZEC"] * snapshot["mid"],
@@ -276,6 +317,7 @@ def build_status() -> dict[str, Any]:
             "final_open_orders": summary.get("final_open_orders") if summary else None,
             "warnings": summary.get("warnings", []) if summary else [],
             "errors": summary.get("errors", []) if summary else [],
+            "basis_policy": latest_policy,
         },
         "warnings_errors": findings,
         "processes": {
@@ -323,7 +365,7 @@ def dashboard_markdown(status: dict[str, Any]) -> str:
         f"- Total: **{fmt_money(portfolio['total_value_usd'])}**",
         f"- USD: {fmt_money(portfolio['USD'])} ({fmt_decimal(portfolio['usd_pct'], 2)}%)",
         f"- ZEC: {fmt_decimal(portfolio['ZEC'], 6)} ZEC = {fmt_money(portfolio['zec_value_usd'])} ({fmt_decimal(portfolio['zec_pct'], 2)}%)",
-        f"- Gemini mid: {fmt_money(portfolio['mid'])}; Coinbase mid: {fmt_money(portfolio['coinbase_mid'])}; basis: {fmt_decimal(portfolio['basis_bp'], 2)} bp",
+        f"- Gemini mid: {fmt_money(portfolio['mid'])}; Coinbase mid: {fmt_money(portfolio['coinbase_mid'])}; signed basis: {fmt_decimal(portfolio['basis_bp'], 2)} bp ({portfolio['basis_direction']}); policy: `{portfolio.get('basis_policy_state')}`",
         "",
         "## Open Orders",
         f"- Buys: {orders['buys']}",

@@ -56,3 +56,21 @@ class GeminiZECPhase5StatusTests(TestCase):
 
         self.assertNotIn("stale_orders:1", alerts)
         self.assertEqual([], alerts)
+
+    def test_order_alerts_flags_basis_side_violation(self):
+        alerts = order_alerts(
+            orders=[{"side": "buy", "remaining_amount": "0.002"}],
+            stale=[],
+            basis_allowed_sides=["SELL"],
+        )
+
+        self.assertIn("open_order_side_violates_basis_policy:buy", alerts)
+
+    def test_order_alerts_flags_orders_when_basis_policy_halted(self):
+        alerts = order_alerts(
+            orders=[{"side": "sell", "remaining_amount": "0.002"}],
+            stale=[],
+            basis_allowed_sides=[],
+        )
+
+        self.assertIn("open_order_side_violates_basis_policy:sell", alerts)

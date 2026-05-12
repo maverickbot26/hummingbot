@@ -25,4 +25,9 @@ volatility_pause_enabled: true
 max_mid_move_pct: 0.02
 manual_pause: false
 one_shot_mode: true
-metrics_schema_version: 1
+basis_mode_enabled: true
+basis_allowed_sides: []
+basis_decision_state: null
+basis_decision_reason: null
+basis_signed_bp: null
+metrics_schema_version: 2

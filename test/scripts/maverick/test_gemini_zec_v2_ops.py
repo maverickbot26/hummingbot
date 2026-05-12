@@ -1,9 +1,94 @@
 import urllib.error
+from decimal import Decimal
 from unittest import TestCase
 from unittest.mock import patch
 
+from scripts.maverick.gemini_zec_basis_policy import (
+    STATE_CHEAP_BUY_ONLY,
+    STATE_HALT_EXTREME,
+    STATE_HALT_STALE,
+    STATE_HALT_SUSTAINED_WIDE,
+    STATE_HALT_UNCONFIRMED,
+    STATE_NORMAL,
+    STATE_RICH_SELL_ONLY,
+    decide_basis_state,
+    make_basis_sample,
+    signed_basis_bp,
+)
 from scripts.maverick.gemini_zec_deadman_watchdog import cancel_all_or_reconcile_zec
 from scripts.maverick.run_gemini_zec_v2_tiny_live_smoke import validate_deadman_heartbeat_config
+
+
+class GeminiZECBasisPolicyTests(TestCase):
+
+    def samples(self, values):
+        return [make_basis_sample(ts, gemini, Decimal("100")) for ts, gemini in values]
+
+    def test_signed_basis_positive_negative_zero_and_invalid(self):
+        self.assertEqual(Decimal("30.0"), signed_basis_bp(Decimal("100.30"), Decimal("100")))
+        self.assertEqual(Decimal("-30.0"), signed_basis_bp(Decimal("99.70"), Decimal("100")))
+        self.assertEqual(Decimal("0"), signed_basis_bp(Decimal("100"), Decimal("100")))
+        with self.assertRaises(ValueError):
+            signed_basis_bp(Decimal("100"), Decimal("0"))
+
+    def test_normal_basis_is_two_sided(self):
+        decision = decide_basis_state(self.samples([(100, Decimal("100.20"))]), now=Decimal("100"))
+
+        self.assertEqual(STATE_NORMAL, decision.state)
+        self.assertEqual(["BUY", "SELL"], decision.allowed_sides)
+        self.assertFalse(decision.halt)
+
+    def test_rich_confirmed_is_sell_only_after_three_samples_and_30s(self):
+        decision = decide_basis_state(self.samples([(70, Decimal("100.31")), (85, Decimal("100.32")), (100, Decimal("100.33"))]), now=Decimal("100"))
+
+        self.assertEqual(STATE_RICH_SELL_ONLY, decision.state)
+        self.assertEqual(["SELL"], decision.allowed_sides)
+        self.assertEqual(["BUY"], decision.suppress_sides)
+        self.assertTrue(decision.confirmed)
+
+    def test_cheap_confirmed_is_buy_only_after_three_samples_and_30s(self):
+        decision = decide_basis_state(self.samples([(70, Decimal("99.69")), (85, Decimal("99.68")), (100, Decimal("99.67"))]), now=Decimal("100"))
+
+        self.assertEqual(STATE_CHEAP_BUY_ONLY, decision.state)
+        self.assertEqual(["BUY"], decision.allowed_sides)
+        self.assertEqual(["SELL"], decision.suppress_sides)
+        self.assertTrue(decision.confirmed)
+
+    def test_previous_directional_state_stays_valid_with_fresh_same_side_sample(self):
+        decision = decide_basis_state(
+            self.samples([(100, Decimal("100.32"))]),
+            now=Decimal("100"),
+            previous_state=STATE_RICH_SELL_ONLY,
+        )
+
+        self.assertEqual(STATE_RICH_SELL_ONLY, decision.state)
+        self.assertEqual(["SELL"], decision.allowed_sides)
+        self.assertFalse(decision.halt)
+
+    def test_unconfirmed_elevated_basis_halts(self):
+        decision = decide_basis_state(self.samples([(100, Decimal("100.28"))]), now=Decimal("100"))
+
+        self.assertEqual(STATE_HALT_UNCONFIRMED, decision.state)
+        self.assertTrue(decision.halt)
+        self.assertEqual([], decision.allowed_sides)
+
+    def test_stale_basis_halts(self):
+        decision = decide_basis_state(self.samples([(90, Decimal("100.20"))]), now=Decimal("100"))
+
+        self.assertEqual(STATE_HALT_STALE, decision.state)
+        self.assertTrue(decision.halt)
+
+    def test_sustained_wide_basis_halts_after_60s(self):
+        decision = decide_basis_state(self.samples([(40, Decimal("100.80")), (70, Decimal("100.82")), (100, Decimal("100.81"))]), now=Decimal("100"))
+
+        self.assertEqual(STATE_HALT_SUSTAINED_WIDE, decision.state)
+        self.assertTrue(decision.halt)
+
+    def test_extreme_basis_halts_immediately(self):
+        decision = decide_basis_state(self.samples([(100, Decimal("101.00"))]), now=Decimal("100"))
+
+        self.assertEqual(STATE_HALT_EXTREME, decision.state)
+        self.assertTrue(decision.halt)
 
 
 class GeminiZECV2OpsTests(TestCase):

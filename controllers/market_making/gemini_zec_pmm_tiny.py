@@ -10,6 +10,7 @@ from hummingbot.strategy_v2.controllers.market_making_controller_base import (
 )
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
+from scripts.maverick.gemini_zec_basis_policy import ALL_SIDES
 
 
 class GeminiZECTinyPMMConfig(MarketMakingControllerConfigBase):
@@ -45,7 +46,12 @@ class GeminiZECTinyPMMConfig(MarketMakingControllerConfigBase):
     max_mid_move_pct: Decimal = Field(default=Decimal("0.02"), gt=Decimal("0"))
     manual_pause: bool = False
     one_shot_mode: bool = True
-    metrics_schema_version: int = 1
+    basis_mode_enabled: bool = False
+    basis_allowed_sides: Optional[List[str]] = None
+    basis_decision_state: Optional[str] = None
+    basis_decision_reason: Optional[str] = None
+    basis_signed_bp: Optional[Decimal] = None
+    metrics_schema_version: int = 2
 
 
 class GeminiZECTinyPMMController(MarketMakingControllerBase):
@@ -55,7 +61,9 @@ class GeminiZECTinyPMMController(MarketMakingControllerBase):
         self._last_reference_price: Optional[Decimal] = None
         self._last_pause_reasons: List[str] = []
         self._last_inventory_suppressed_sides: List[str] = []
+        self._last_basis_suppressed_sides: List[str] = []
         self._last_inventory_status: Dict[str, Optional[str]] = {}
+        self._last_basis_status: Dict[str, Optional[str]] = {}
         self._last_quote_prices: Dict[str, str] = {}
         self._last_quote_amounts: Dict[str, str] = {}
         self._one_shot_started_level_ids: Set[str] = set()
@@ -67,6 +75,11 @@ class GeminiZECTinyPMMController(MarketMakingControllerBase):
 
         if self.config.manual_pause or self.config.manual_kill_switch:
             pause_reasons.append("manual_pause")
+
+        basis_status = self._basis_status()
+        self._last_basis_status = basis_status
+        if self.config.basis_mode_enabled and not basis_status.get("allowed_sides"):
+            pause_reasons.append("basis_policy_halt")
 
         if self.config.external_mid_reference is not None:
             external_mid = Decimal(str(self.config.external_mid_reference))
@@ -107,10 +120,23 @@ class GeminiZECTinyPMMController(MarketMakingControllerBase):
     def get_levels_to_execute(self) -> List[str]:
         level_ids = super().get_levels_to_execute()
         suppressed_sides = self._inventory_suppressed_sides()
+        basis_suppressed_sides = self._basis_suppressed_sides()
         self._last_inventory_suppressed_sides = suppressed_sides
-        if not suppressed_sides:
+        self._last_basis_suppressed_sides = basis_suppressed_sides
+        combined_suppressed_sides = sorted(set(suppressed_sides) | set(basis_suppressed_sides))
+        if not combined_suppressed_sides:
             return level_ids
-        return [level_id for level_id in level_ids if self.get_trade_type_from_level_id(level_id).name not in suppressed_sides]
+        filtered_level_ids = [
+            level_id
+            for level_id in level_ids
+            if self.get_trade_type_from_level_id(level_id).name not in combined_suppressed_sides
+        ]
+        if level_ids and not filtered_level_ids:
+            pause_reasons = list(self.processed_data.get("pause_reasons", []))
+            if "basis_inventory_no_safe_side" not in pause_reasons:
+                pause_reasons.append("basis_inventory_no_safe_side")
+            self.processed_data.update({"paused": True, "pause_reasons": pause_reasons})
+        return filtered_level_ids
 
     def get_price_and_amount(self, level_id: str):
         level = self.get_level_from_level_id(level_id)
@@ -170,6 +196,13 @@ class GeminiZECTinyPMMController(MarketMakingControllerBase):
             "max_inventory_deviation_base": str(self.config.max_inventory_deviation_base),
             "inventory_suppressed_sides": list(self._last_inventory_suppressed_sides),
             "inventory_status": dict(self._last_inventory_status),
+            "basis_mode_enabled": self.config.basis_mode_enabled,
+            "basis_allowed_sides": list(self.config.basis_allowed_sides or []),
+            "basis_suppressed_sides": list(self._last_basis_suppressed_sides),
+            "basis_decision_state": self.config.basis_decision_state,
+            "basis_decision_reason": self.config.basis_decision_reason,
+            "basis_signed_bp": str(self.config.basis_signed_bp) if self.config.basis_signed_bp is not None else None,
+            "basis_status": dict(self._last_basis_status),
             "one_shot_mode": self.config.one_shot_mode,
             "one_shot_started_level_ids": sorted(self._one_shot_started_level_ids),
             "last_quote_prices": dict(self._last_quote_prices),
@@ -198,6 +231,31 @@ class GeminiZECTinyPMMController(MarketMakingControllerBase):
             self._last_inventory_status["suppression_reason"] = "current_base_above_upper_bound"
             return [TradeType.BUY.name]
         return []
+
+    def _basis_status(self) -> Dict[str, Optional[str]]:
+        if not self.config.basis_mode_enabled:
+            return {
+                "enabled": "false",
+                "allowed_sides": None,
+                "suppression_reason": None,
+            }
+        allowed_sides = [side for side in (self.config.basis_allowed_sides or []) if side in ALL_SIDES]
+        suppressed_sides = [side for side in ALL_SIDES if side not in allowed_sides]
+        return {
+            "enabled": "true",
+            "allowed_sides": ",".join(allowed_sides),
+            "suppressed_sides": ",".join(suppressed_sides),
+            "state": self.config.basis_decision_state,
+            "reason": self.config.basis_decision_reason,
+            "basis_bp": str(self.config.basis_signed_bp) if self.config.basis_signed_bp is not None else None,
+            "suppression_reason": self.config.basis_decision_reason if suppressed_sides else None,
+        }
+
+    def _basis_suppressed_sides(self) -> List[str]:
+        if not self.config.basis_mode_enabled:
+            return []
+        allowed_sides = [side for side in (self.config.basis_allowed_sides or []) if side in ALL_SIDES]
+        return [side for side in ALL_SIDES if side not in allowed_sides]
 
     def get_effective_base_position(self) -> Decimal:
         """Return the base inventory used by the guard.

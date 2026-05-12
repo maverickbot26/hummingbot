@@ -72,7 +72,7 @@ class GeminiZECTinyPMMControllerTests(TestCase):
         self.assertEqual(Decimal("562.897335"), by_level["sell_0"].price)
 
         metrics = controller.get_custom_info()
-        self.assertEqual(1, metrics["metrics_schema_version"])
+        self.assertEqual(2, metrics["metrics_schema_version"])
         self.assertFalse(metrics["paused"])
         self.assertTrue(metrics["zero_fee_accounting"])
         self.assertEqual("0.002", metrics["effective_order_size_base"])
@@ -151,6 +151,89 @@ class GeminiZECTinyPMMControllerTests(TestCase):
         self.assertEqual("0.500", metrics["inventory_status"]["current_base_amount"])
         self.assertEqual("starting_base_amount_plus_v2_positions", metrics["inventory_status"]["position_source"])
 
+    def test_basis_policy_rich_suppresses_buy(self):
+        controller = self.make_controller(
+            basis_mode_enabled=True,
+            basis_allowed_sides=["SELL"],
+            basis_decision_state="gemini_rich_sell_only",
+            basis_decision_reason="gemini_rich_confirmed_sell_only:31bp",
+            basis_signed_bp=Decimal("31"),
+        )
+        self.async_run(controller.update_processed_data())
+
+        actions = controller.determine_executor_actions()
+
+        self.assertEqual(["sell_0"], [action.executor_config.level_id for action in actions])
+        metrics = controller.get_custom_info()
+        self.assertEqual(["BUY"], metrics["basis_suppressed_sides"])
+        self.assertEqual("gemini_rich_sell_only", metrics["basis_decision_state"])
+
+    def test_basis_policy_cheap_suppresses_sell(self):
+        controller = self.make_controller(
+            basis_mode_enabled=True,
+            basis_allowed_sides=["BUY"],
+            basis_decision_state="gemini_cheap_buy_only",
+            basis_decision_reason="gemini_cheap_confirmed_buy_only:-31bp",
+            basis_signed_bp=Decimal("-31"),
+        )
+        self.async_run(controller.update_processed_data())
+
+        actions = controller.determine_executor_actions()
+
+        self.assertEqual(["buy_0"], [action.executor_config.level_id for action in actions])
+        self.assertEqual(["SELL"], controller.get_custom_info()["basis_suppressed_sides"])
+
+    def test_basis_policy_halt_blocks_quotes_with_explicit_reason(self):
+        controller = self.make_controller(
+            basis_mode_enabled=True,
+            basis_allowed_sides=[],
+            basis_decision_state="halt_unconfirmed_basis",
+            basis_decision_reason="basis_unconfirmed_or_mixed_sign",
+            basis_signed_bp=Decimal("28"),
+        )
+        self.async_run(controller.update_processed_data())
+
+        self.assertEqual([], controller.determine_executor_actions())
+        metrics = controller.get_custom_info()
+        self.assertTrue(metrics["paused"])
+        self.assertIn("basis_policy_halt", metrics["pause_reasons"])
+
+    def test_inventory_guard_wins_over_basis_sell_only(self):
+        controller = self.make_controller(
+            target_base_amount=Decimal("0.500"),
+            max_inventory_deviation_base=Decimal("0.010"),
+            basis_mode_enabled=True,
+            basis_allowed_sides=["SELL"],
+            basis_decision_state="gemini_rich_sell_only",
+            basis_decision_reason="gemini_rich_confirmed_sell_only:31bp",
+            basis_signed_bp=Decimal("31"),
+        )
+        controller.positions_held = [self.make_position(Decimal("0.480"))]
+        self.async_run(controller.update_processed_data())
+
+        self.assertEqual([], controller.determine_executor_actions())
+        metrics = controller.get_custom_info()
+        self.assertIn("basis_inventory_no_safe_side", metrics["pause_reasons"])
+        self.assertEqual(["SELL"], metrics["inventory_suppressed_sides"])
+
+    def test_inventory_guard_wins_over_basis_buy_only(self):
+        controller = self.make_controller(
+            target_base_amount=Decimal("0.500"),
+            max_inventory_deviation_base=Decimal("0.010"),
+            basis_mode_enabled=True,
+            basis_allowed_sides=["BUY"],
+            basis_decision_state="gemini_cheap_buy_only",
+            basis_decision_reason="gemini_cheap_confirmed_buy_only:-31bp",
+            basis_signed_bp=Decimal("-31"),
+        )
+        controller.positions_held = [self.make_position(Decimal("0.520"))]
+        self.async_run(controller.update_processed_data())
+
+        self.assertEqual([], controller.determine_executor_actions())
+        metrics = controller.get_custom_info()
+        self.assertIn("basis_inventory_no_safe_side", metrics["pause_reasons"])
+        self.assertEqual(["BUY"], metrics["inventory_suppressed_sides"])
+
     def test_external_mid_sanity_pause_blocks_quotes(self):
         controller = self.make_controller(external_mid_reference=Decimal("600"), max_external_mid_deviation_pct=Decimal("0.01"))
         self.async_run(controller.update_processed_data())
@@ -202,7 +285,7 @@ class GeminiZECV2LiveSmokePreflightTests(TestCase):
             "action_count": 1,
         }
 
-        with self.assertRaisesRegex(RuntimeError, "expected two-sided"):
+        with self.assertRaisesRegex(RuntimeError, "explicit basis/inventory suppression"):
             validate_controller_quote_plan(plan)
 
     def test_preflight_allows_one_sided_with_explicit_inventory_suppression(self):
@@ -216,6 +299,41 @@ class GeminiZECV2LiveSmokePreflightTests(TestCase):
             "sides": ["BUY"],
             "quote_snapshot": {"buy_0": {"side": "BUY"}},
             "action_count": 1,
+        }
+
+        validate_controller_quote_plan(plan)
+
+    def test_preflight_allows_one_sided_with_explicit_basis_suppression(self):
+        plan = {
+            "metrics": {
+                "paused": False,
+                "inventory_suppressed_sides": [],
+                "inventory_status": {},
+                "basis_suppressed_sides": ["BUY"],
+                "basis_decision_reason": "gemini_rich_confirmed_sell_only:31bp",
+            },
+            "two_sided": False,
+            "sides": ["SELL"],
+            "quote_snapshot": {"sell_0": {"side": "SELL"}},
+            "action_count": 1,
+        }
+
+        validate_controller_quote_plan(plan)
+
+    def test_preflight_allows_basis_policy_halt_zero_quotes(self):
+        plan = {
+            "metrics": {
+                "paused": True,
+                "pause_reasons": ["basis_policy_halt"],
+                "inventory_suppressed_sides": [],
+                "inventory_status": {},
+                "basis_suppressed_sides": ["BUY", "SELL"],
+                "basis_decision_reason": "basis_unconfirmed_or_mixed_sign",
+            },
+            "two_sided": False,
+            "sides": [],
+            "quote_snapshot": {},
+            "action_count": 0,
         }
 
         validate_controller_quote_plan(plan)

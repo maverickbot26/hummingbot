@@ -30,6 +30,13 @@ from typing import Any
 import yaml
 
 from controllers.market_making.gemini_zec_pmm_tiny import GeminiZECTinyPMMConfig, GeminiZECTinyPMMController
+from scripts.maverick.gemini_zec_basis_policy import (
+    BasisDecision,
+    BasisPolicyConfig,
+    BasisSample,
+    decide_basis_state,
+    make_basis_sample,
+)
 from scripts.maverick.run_zec_tiny_supervised_pilot import (
     GeminiPrivate,
     balances,
@@ -58,8 +65,7 @@ MAX_SINGLE_ORDER_ZEC = Decimal("0.0025")
 MAX_TOTAL_REMAINING_ZEC = Decimal("0.0055")
 MOVE_WINDOW_SECONDS = 300
 MOVE_THRESHOLD_BP = Decimal("300")
-BASIS_THRESHOLD_BP = Decimal("50")
-BASIS_DURATION_SECONDS = 60
+BASIS_POLICY_CONFIG = BasisPolicyConfig()
 DEFAULT_DEADMAN_STALE_SECONDS = 45
 DEFAULT_HEARTBEAT_SECONDS = 10
 MAX_HEARTBEAT_STALE_RATIO = 3
@@ -135,6 +141,13 @@ def assert_order_bounds(orders: list[dict[str, Any]]) -> None:
         raise RuntimeError(f"single_order_exceeds_tiny_bound: {max_remaining}")
 
 
+def assert_open_order_sides(orders: list[dict[str, Any]], allowed_sides: list[str]) -> None:
+    allowed = {side.lower() for side in allowed_sides}
+    invalid = [order for order in orders if str(order.get("side", "")).lower() not in allowed]
+    if invalid:
+        raise RuntimeError(f"open_order_side_violates_basis_policy:{sanitize_orders(invalid)}")
+
+
 def validate_deadman_heartbeat_config(check_seconds: int, heartbeat_seconds: int, deadman_stale_seconds: int) -> None:
     if check_seconds <= 0:
         raise ValueError("check_seconds must be positive")
@@ -208,10 +221,13 @@ async def controller_quote_plan_from_config(
     controller_path: Path,
     mid_price: Decimal,
     starting_base_amount: Decimal | None,
+    basis_decision: BasisDecision | None = None,
 ) -> dict[str, Any]:
     config_data = load_yaml(controller_path)
     if starting_base_amount is not None:
         config_data["starting_base_amount"] = str(starting_base_amount)
+    if basis_decision is not None:
+        config_data.update(basis_decision.as_config_fields())
     config = GeminiZECTinyPMMConfig(**config_data)
     controller = GeminiZECTinyPMMController(
         config=config,
@@ -231,42 +247,81 @@ async def controller_quote_plan_from_config(
         "action_count": len(actions),
         "sides": sides,
         "metrics": metrics,
+        "basis_policy": basis_decision.as_dict() if basis_decision is not None else None,
         "two_sided": sides == ["BUY", "SELL"],
     }
 
 
 def validate_controller_quote_plan(plan: dict[str, Any]) -> None:
     metrics = plan["metrics"]
+    pause_reasons = metrics.get("pause_reasons") or []
     if metrics.get("paused"):
-        raise RuntimeError(f"Controller preflight paused: {metrics.get('pause_reasons')}")
-    suppressed_sides = metrics.get("inventory_suppressed_sides") or []
-    suppression_reason = (metrics.get("inventory_status") or {}).get("suppression_reason")
-    if not suppressed_sides and not plan["two_sided"]:
-        raise RuntimeError(f"Controller preflight expected two-sided quotes but got {plan['sides']}: {plan['quote_snapshot']}")
-    if suppressed_sides and not suppression_reason:
+        if "basis_policy_halt" in pause_reasons and plan["action_count"] == 0:
+            return
+        raise RuntimeError(f"Controller preflight paused: {pause_reasons}")
+
+    inventory_suppressed_sides = metrics.get("inventory_suppressed_sides") or []
+    inventory_reason = (metrics.get("inventory_status") or {}).get("suppression_reason")
+    basis_suppressed_sides = metrics.get("basis_suppressed_sides") or []
+    basis_reason = metrics.get("basis_decision_reason")
+    explicit_suppression = bool((inventory_suppressed_sides and inventory_reason) or (basis_suppressed_sides and basis_reason))
+
+    if plan["two_sided"]:
+        return
+    if plan["action_count"] == 0:
+        if explicit_suppression:
+            return
+        raise RuntimeError(f"Controller preflight produced zero quotes without explicit basis/inventory reason: {metrics}")
+    if plan["action_count"] != 1:
+        raise RuntimeError(f"Controller preflight expected one-sided quote but got {plan['quote_snapshot']}")
+    if not explicit_suppression:
+        raise RuntimeError(f"Controller preflight expected two-sided quotes or explicit basis/inventory suppression but got {plan['sides']}: {plan['quote_snapshot']}")
+    if inventory_suppressed_sides and not inventory_reason:
         raise RuntimeError(f"Controller preflight had inventory suppression without explicit reason: {metrics}")
-    if suppressed_sides and plan["action_count"] != 1:
-        raise RuntimeError(f"Controller preflight expected one-sided inventory-suppressed quote but got {plan['quote_snapshot']}")
+    if basis_suppressed_sides and not basis_reason:
+        raise RuntimeError(f"Controller preflight had basis suppression without explicit reason: {metrics}")
 
 
-async def build_and_validate_preflight_plan(v2_config: str, mid_price: Decimal, starting_base_amount: Decimal) -> dict[str, Any]:
+async def build_and_validate_preflight_plan(
+    v2_config: str,
+    mid_price: Decimal,
+    starting_base_amount: Decimal,
+    basis_decision: BasisDecision | None = None,
+) -> dict[str, Any]:
     plans: list[dict[str, Any]] = []
     legacy_plans: list[dict[str, Any]] = []
     for _, controller_path in controller_config_paths(v2_config):
-        plan = await controller_quote_plan_from_config(controller_path, mid_price, starting_base_amount)
+        plan = await controller_quote_plan_from_config(controller_path, mid_price, starting_base_amount, basis_decision)
         validate_controller_quote_plan(plan)
         plans.append(plan)
-        legacy_plans.append(await controller_quote_plan_from_config(controller_path, mid_price, None))
+        legacy_plans.append(await controller_quote_plan_from_config(controller_path, mid_price, None, basis_decision))
     return {
         "v2_config": v2_config,
         "mid_price": str(mid_price),
         "starting_base_amount": str(starting_base_amount),
+        "basis_policy": basis_decision.as_dict() if basis_decision is not None else None,
         "controllers": plans,
         "legacy_without_starting_base_amount": legacy_plans,
     }
 
 
-def build_runtime_v2_config(v2_config: str, run_id: str, starting_base_amount: Decimal) -> str:
+def collect_basis_policy_decision(
+    sample_count: int = BASIS_POLICY_CONFIG.confirmation_samples,
+    confirmation_seconds: Decimal = BASIS_POLICY_CONFIG.confirmation_seconds,
+    sampler=None,
+) -> BasisDecision:
+    sampler = sampler or (lambda: (gemini_mid(), coinbase_mid()))
+    samples: list[BasisSample] = []
+    sleep_seconds = float(confirmation_seconds / Decimal(max(1, sample_count - 1))) if sample_count > 1 else 0.0
+    for index in range(sample_count):
+        g_mid, c_mid = sampler()
+        samples.append(make_basis_sample(time.monotonic(), g_mid, c_mid))
+        if index < sample_count - 1:
+            time.sleep(sleep_seconds)
+    return decide_basis_state(samples, now=time.monotonic(), config=BASIS_POLICY_CONFIG)
+
+
+def build_runtime_v2_config(v2_config: str, run_id: str, starting_base_amount: Decimal, basis_decision: BasisDecision | None = None) -> str:
     script_path = REPO_ROOT / "conf" / "scripts" / v2_config
     script_config = load_yaml(script_path)
     runtime_controllers: list[str] = []
@@ -274,6 +329,8 @@ def build_runtime_v2_config(v2_config: str, run_id: str, starting_base_amount: D
         source_controller_path = REPO_ROOT / "conf" / "controllers" / rel_path
         controller_config = load_yaml(source_controller_path)
         controller_config["starting_base_amount"] = str(starting_base_amount)
+        if basis_decision is not None:
+            controller_config.update(basis_decision.as_config_fields())
         source_rel = Path(rel_path)
         runtime_rel = str(source_rel.with_name(f"{source_rel.stem}_runtime_{run_id}{source_rel.suffix}"))
         dump_yaml(REPO_ROOT / "conf" / "controllers" / runtime_rel, controller_config)
@@ -375,35 +432,37 @@ def main() -> int:
         assert_order_bounds(pre_orders)
 
         start_balances = balances(gemini)
-        start_mid = gemini_mid()
-        coinbase_start_mid = coinbase_mid()
         if start_balances["USD"] <= Decimal("5") or start_balances["ZEC"] < Decimal("0.004"):
             raise RuntimeError(f"Refusing to start: balances not sane USD={start_balances['USD']} ZEC={start_balances['ZEC']}")
-        basis_start_bp = abs(pct_bp(start_mid, coinbase_start_mid))
-        if basis_start_bp > BASIS_THRESHOLD_BP:
-            raise RuntimeError(f"Refusing to start: Gemini/Coinbase basis too wide {basis_start_bp:.1f}bp")
 
-        preflight_plan = asyncio.run(build_and_validate_preflight_plan(args.v2_config, start_mid, start_balances["ZEC"]))
+        basis_decision = collect_basis_policy_decision()
+        latest_basis_sample = basis_decision.samples[-1] if basis_decision.samples else {}
+        start_mid = Decimal(str(latest_basis_sample.get("gemini_mid", "0")))
+        coinbase_start_mid = Decimal(str(latest_basis_sample.get("coinbase_mid", "0")))
+        preflight_plan = asyncio.run(build_and_validate_preflight_plan(args.v2_config, start_mid, start_balances["ZEC"], basis_decision))
 
         if args.dry_run_preflight:
             log_event({
-                "event": "dry_run_preflight_ok",
+                "event": "dry_run_preflight_ok" if not basis_decision.halt else "dry_run_preflight_basis_halt",
                 "balances": start_balances,
                 "gemini_mid": start_mid,
                 "coinbase_mid": coinbase_start_mid,
-                "basis_bp": basis_start_bp,
+                "basis_policy": basis_decision.as_dict(),
                 "open_orders": len(pre_orders),
                 "max_single_order_zec": MAX_SINGLE_ORDER_ZEC,
                 "max_total_remaining_zec": MAX_TOTAL_REMAINING_ZEC,
                 "controller_preflight": preflight_plan,
             })
-            return 0
+            return 2 if basis_decision.halt else 0
+        if basis_decision.halt:
+            raise RuntimeError(f"Refusing to start: basis policy halt {basis_decision.state}: {basis_decision.reason}")
 
-        runtime_v2_config = build_runtime_v2_config(args.v2_config, run_id, start_balances["ZEC"])
+        runtime_v2_config = build_runtime_v2_config(args.v2_config, run_id, start_balances["ZEC"], basis_decision)
         started_ms = int(time.time() * 1000)
         start_snapshot = portfolio_snapshot(gemini)
         history: deque[MidSnapshot] = deque()
-        basis_first_bad: float | None = None
+        basis_samples: deque[BasisSample] = deque()
+        latest_basis_decision = basis_decision
         stop_reason = "runtime_complete"
         warnings: list[str] = []
         errors: list[str] = []
@@ -423,6 +482,7 @@ def main() -> int:
             "v2_config": args.v2_config,
             "runtime_v2_config": runtime_v2_config,
             "controller_preflight": preflight_plan,
+            "basis_policy": basis_decision.as_dict(),
             "runtime_seconds": args.runtime_seconds,
             "hb_log": str(hb_log_path),
             "watchdog_log": str(watchdog_log_path) if watchdog_log_path else None,
@@ -460,30 +520,43 @@ def main() -> int:
                 orders = open_zec_orders(gemini)
                 try:
                     assert_order_bounds(orders)
+                    assert_open_order_sides(orders, basis_decision.allowed_sides)
                 except RuntimeError as exc:
                     stop_reason = str(exc).split(":", 1)[0]
                     errors.append(str(exc))
                     break
 
                 now = time.time()
+                mono_now = time.monotonic()
                 g_mid = gemini_mid()
                 c_mid = coinbase_mid()
                 snapshot = MidSnapshot(now, g_mid, c_mid)
                 history.append(snapshot)
+                basis_samples.append(make_basis_sample(mono_now, g_mid, c_mid))
                 while history and now - history[0].ts > MOVE_WINDOW_SECONDS:
                     history.popleft()
+                while basis_samples and mono_now - float(basis_samples[0].ts) > float(BASIS_POLICY_CONFIG.sustained_halt_seconds + BASIS_POLICY_CONFIG.confirmation_seconds + Decimal("10")):
+                    basis_samples.popleft()
                 move_bp = abs(pct_bp(g_mid, history[0].gemini)) if history else Decimal("0")
-                basis_bp = abs(pct_bp(g_mid, c_mid))
+                latest_basis_decision = decide_basis_state(list(basis_samples), now=mono_now, previous_state=basis_decision.state, config=BASIS_POLICY_CONFIG)
                 if move_bp > MOVE_THRESHOLD_BP:
                     stop_reason = f"volatility_move_{move_bp:.1f}bp"
                     break
-                if basis_bp > BASIS_THRESHOLD_BP:
-                    basis_first_bad = basis_first_bad or now
-                    if now - basis_first_bad >= BASIS_DURATION_SECONDS:
-                        stop_reason = f"gemini_coinbase_basis_{basis_bp:.1f}bp"
-                        break
-                else:
-                    basis_first_bad = None
+                if basis_decision.state == "gemini_rich_sell_only" and latest_basis_decision.basis_bp is not None and latest_basis_decision.basis_bp < 0:
+                    stop_reason = "basis_policy_sign_flip_against_sell_only"
+                    break
+                if basis_decision.state == "gemini_cheap_buy_only" and latest_basis_decision.basis_bp is not None and latest_basis_decision.basis_bp > 0:
+                    stop_reason = "basis_policy_sign_flip_against_buy_only"
+                    break
+                if latest_basis_decision.halt:
+                    stop_reason = f"basis_policy_{latest_basis_decision.state}"
+                    break
+                if latest_basis_decision.state != basis_decision.state and basis_decision.state != "normal_two_sided":
+                    stop_reason = f"basis_policy_state_changed:{latest_basis_decision.state}"
+                    break
+                if basis_decision.state == "normal_two_sided" and latest_basis_decision.state != "normal_two_sided":
+                    stop_reason = f"basis_policy_state_changed:{latest_basis_decision.state}"
+                    break
 
                 trades = zec_trades_since(gemini, started_ms)
                 log_event({
@@ -494,7 +567,7 @@ def main() -> int:
                     "recent_fills": len(trades),
                     "gemini_mid": g_mid,
                     "coinbase_mid": c_mid,
-                    "basis_bp": basis_bp,
+                    "basis_policy": latest_basis_decision.as_dict(),
                     "orders": sanitize_orders(orders),
                 })
                 sleep_with_heartbeat(args.check_seconds, args.heartbeat_seconds)
@@ -521,6 +594,10 @@ def main() -> int:
             "v2_config": args.v2_config,
             "runtime_v2_config": runtime_v2_config,
             "controller_preflight": preflight_plan,
+            "basis_policy": {
+                "preflight": basis_decision.as_dict(),
+                "latest": latest_basis_decision.as_dict(),
+            },
             "started_ms": started_ms,
             "runtime_seconds_requested": args.runtime_seconds,
             "check_seconds": args.check_seconds,
