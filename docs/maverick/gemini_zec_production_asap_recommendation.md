@@ -1,10 +1,12 @@
 # Gemini ZEC V2 Production-ASAP Recommendation
 
-Updated: 2026-05-11 17:55 EDT
+Updated: 2026-05-11 20:12 EDT
 
 ## Current supervised retry outcome
 
-- Run: `20260511_205305`
+Two consecutive 60-minute supervised tiny live runs have now completed with the corrected heartbeat/deadman settings.
+
+Latest run: `20260511_231051`
 - Command used:
   ```bash
   /opt/homebrew/bin/micromamba run -n hummingbot python scripts/maverick/run_gemini_zec_v2_tiny_live_smoke.py \
@@ -15,22 +17,25 @@ Updated: 2026-05-11 17:55 EDT
   ```
 - Result: `runtime_complete`
 - Final Gemini ZEC-USD open orders: `0`
-- Final bot/deadman processes: `0`
+- Final bot/deadman/headless processes: `0`
 - Deadman heartbeat fix worked: independent 10s heartbeat stayed fresh during 300s monitor checks.
 - Cancel fallback remains armed: stale heartbeat cancel uses `/v1/order/cancel/all`, then reconciles `/v1/orders` and individually cancels ZEC orders via `/v1/order/cancel` if needed.
-- Trades: 1 maker BUY fill, `0.002 ZEC`, `$1.12044` notional, `$0` fee reported.
-- Latest status: `Healthy`, no alerts.
+- Trades: 1 maker BUY fill, `0.002 ZEC @ $558.42`, `$1.11684` notional, `$0` fee reported; resting SELL was canceled by strategy.
+- Latest clean status: `Healthy`, no alerts.
+- PnL: portfolio `-$0.48827155`, hold `-$0.48938155`, MM alpha `+$0.00111`.
+
+Previous corrected run: `20260511_205305`
+- Result: `runtime_complete`; final open orders `0`; final bot/deadman processes `0`; 1 maker BUY fill (`0.002 ZEC`, `$1.12044` notional, `$0` fee); final status `Healthy`.
 
 ## Minimum remaining blockers
 
-1. Eric approval to proceed beyond one-hour supervised smoke into supervised production mini.
-2. Keep size unchanged for the first production mini; no cron/unattended launch until Eric separately approves.
-3. Run one longer supervised production mini with the same deadman settings and verify:
+1. Keep size unchanged for the first production mini; no cron/unattended launch until Eric separately approves.
+2. If Eric wants more evidence before unattended mode, run one longer supervised production mini with the same deadman settings and verify:
    - final open orders = `0`
    - no bot/deadman processes left
    - status monitor reports `Healthy`
    - no recurring Hummingbot/Gemini connector errors
-4. Only after the longer supervised mini is clean: ask Eric for explicit approval before enabling unattended automation.
+3. Only after Eric explicitly approves unattended trading: enable any cron/automation that can place orders.
 
 ## Exact supervised production mini config
 

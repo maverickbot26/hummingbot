@@ -1,14 +1,14 @@
 # Gemini ZEC V2 Phase 5 Ops Dashboard
 
-Generated epoch: `1778536579`
+Generated epoch: `1778544704`
 Read: **Healthy** (`go_for_supervised_mini_ops`)
 Live supervised: `False`
 
 ## Portfolio
-- Total: **$647.81**
-- USD: $327.19 (50.51%)
-- ZEC: 0.575743 ZEC = $320.63 (49.49%)
-- Gemini mid: $556.89; Coinbase mid: $555.94; basis: 17.00 bp
+- Total: **$649.16**
+- USD: $326.07 (50.23%)
+- ZEC: 0.577743 ZEC = $323.09 (49.77%)
+- Gemini mid: $559.22; Coinbase mid: $558.37; basis: 15.22 bp
 
 ## Open Orders
 - Buys: 0
@@ -17,16 +17,16 @@ Live supervised: `False`
 - Total remaining: 0 ZEC
 
 ## Latest Live Summary
-- Path: `logs/maverick_zec_v2_live_smoke_summary_20260511_205305.json`
+- Path: `logs/maverick_zec_v2_live_smoke_summary_20260511_231051.json`
 - Stop reason: `runtime_complete`
 - Final open orders: 0
-- Trades: `{"buy_zec": "0.002", "count": 1, "fee_amount": "0", "fee_currency": "none", "net_zec": "0.002", "notional_usd": "1.12044", "sell_zec": 0, "volume_zec": "0.002"}`
-- PnL / hold / alpha: -2.28517971000 / -2.27775971000 / -0.00742000000
+- Trades: `{"buy_zec": "0.002", "count": 1, "fee_amount": "0", "fee_currency": "none", "net_zec": "0.002", "notional_usd": "1.11684", "sell_zec": 0, "volume_zec": "0.002"}`
+- PnL / hold / alpha: -0.48827155000 / -0.48938155000 / 0.00111000000
 
 ## Watchdog / Heartbeat
 - Status: `not_running_ok_no_live_process`
 - Processes: `[]`
-- Heartbeat: `{'path': 'logs/zec_v2_mm.heartbeat', 'exists': True, 'age_seconds': 181.127, 'stale': True, 'value': 'stopped 1778536398.312795'}`
+- Heartbeat: `{'path': 'logs/zec_v2_mm.heartbeat', 'exists': True, 'age_seconds': 38.948, 'stale': False, 'value': 'stopped 1778544665.0074'}`
 
 ## Alerts
 - none
